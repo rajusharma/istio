@@ -38,55 +38,66 @@ set -x
 # shellcheck source=prow/lib.sh
 source "${ROOT}/prow/lib.sh"
 setup_and_export_git_sha
-setup_kind_cluster
-
-echo 'Build'
-(cd "${ROOT}"; make build)
-
-E2E_ARGS+=("--test_logs_path=${ARTIFACTS_DIR}")
-# e2e tests with kind clusters on prow will get deleted when prow
-# deleted the pod 
-E2E_ARGS+=("--skip_cleanup")
-E2E_ARGS+=("--use_local_cluster")
 
 # getopts only handles single character flags
 for ((i=1; i<=$#; i++)); do
     case ${!i} in
+        # Node images can be found at https://github.com/kubernetes-sigs/kind/releases
+        # For example, kindest/node:v1.14.0
+        --node-image)
+          ((i++))
+          NODE_IMAGE=${!i}
+        ;;
+        --skip-setup)
+          SKIP_SETUP=true
+          continue
+        ;;
+        --skip-build)
+          SKIP_BUILD=true
+          continue
+        ;;
+        --skip-cleanup)
+          SKIP_CLEANUP=true
+          continue
+        ;;
         # -s/--single_test to specify test target to run.
         # e.g. "-s e2e_mixer" will trigger e2e mixer_test
         -s|--single_test) ((i++)); SINGLE_TEST=${!i}
         continue
         ;;
-        --timeout) ((i++)); E2E_TIMEOUT=${!i}
+        --variant) ((i++)); VARIANT="${!i}"
         continue
         ;;
     esac
     E2E_ARGS+=( "${!i}" )
 done
 
-export HUB=${HUB:-"kindtest"}
-export TAG="${TAG:-${GIT_SHA}}"
+
+E2E_ARGS+=("--test_logs_path=${ARTIFACTS}")
+# e2e tests with kind clusters on prow will get deleted when prow deletes the pod
+E2E_ARGS+=("--skip_cleanup")
+E2E_ARGS+=("--use_local_cluster")
+
+# KinD will have the images loaded into it; it should not attempt to pull them
+# See https://kind.sigs.k8s.io/docs/user/quick-start/#loading-an-image-into-your-cluster
+E2E_ARGS+=("--image_pull_policy" "IfNotPresent")
+
+export HUB=${HUB:-"istio-testing"}
+export TAG="${TAG:-"istio-testing"}"
 
 make init
-make docker
 
-function build_kind_images(){
-	# Create a temp directory to store the archived images.
-	TMP_DIR=$(mktemp -d)
-	IMAGE_FILE="${TMP_DIR}"/image.tar
+if [[ -z "${SKIP_SETUP:-}" ]]; then
+  time setup_kind_cluster "${NODE_IMAGE:-}"
+fi
 
-	# Archived local images and load it into KinD's docker daemon
-	# Kubernetes in KinD can only access local images from its docker daemon.
-	docker images "${HUB}"/*:"${TAG}"| awk 'FNR>1 {print $1 ":" $2}' | xargs docker save -o "${IMAGE_FILE}"
-	kind load --name e2e-suite image-archive "${IMAGE_FILE}"
+if [[ -z "${SKIP_BUILD:-}" ]]; then
+  time build_images
+  time kind_load_images ""
+fi
 
-	# Delete the local tar images.
-	rm -rf "${IMAGE_FILE}"
-}
+if [[ "${ENABLE_ISTIO_CNI:-false}" == true ]]; then
+   cni_run_daemon_kind
+fi
 
-build_kind_images
-
-time ISTIO_DOCKER_HUB=$HUB \
-  E2E_ARGS="${E2E_ARGS[*]}" \
-  JUNIT_E2E_XML="${ARTIFACTS_DIR}/junit.xml" \
-  make with_junit_report TARGET="${SINGLE_TEST}" ${E2E_TIMEOUT:+ E2E_TIMEOUT="${E2E_TIMEOUT}"}
+time make with_junit_report E2E_ARGS="${E2E_ARGS[*]}" TARGET="${SINGLE_TEST}" ${VARIANT:+ VARIANT="${VARIANT}"}

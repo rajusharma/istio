@@ -20,17 +20,22 @@ import (
 	"time"
 
 	"github.com/hashicorp/go-multierror"
+	"k8s.io/apimachinery/pkg/version"
 
 	istioKube "istio.io/istio/pkg/kube"
 	"istio.io/istio/pkg/test/scopes"
 	"istio.io/istio/pkg/test/util/retry"
 
+	kubeApiAdmissions "k8s.io/api/admissionregistration/v1beta1"
 	kubeApiCore "k8s.io/api/core/v1"
 	kubeApiExt "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1beta1"
 	kubeExtClient "k8s.io/apiextensions-apiserver/pkg/client/clientset/clientset"
 	"k8s.io/apimachinery/pkg/api/errors"
 	kubeApiMeta "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/runtime/serializer"
+	"k8s.io/client-go/dynamic"
 	kubeClient "k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/kubernetes/scheme"
 	kubeClientCore "k8s.io/client-go/kubernetes/typed/core/v1"
@@ -54,6 +59,7 @@ type Accessor struct {
 	ctl        *kubectl
 	set        *kubeClient.Clientset
 	extSet     *kubeExtClient.Clientset
+	dynClient  dynamic.Interface
 }
 
 // NewAccessor returns a new instance of an accessor.
@@ -64,7 +70,7 @@ func NewAccessor(kubeConfig string, baseWorkDir string) (*Accessor, error) {
 	}
 	restConfig.APIPath = "/api"
 	restConfig.GroupVersion = &kubeApiCore.SchemeGroupVersion
-	restConfig.NegotiatedSerializer = serializer.DirectCodecFactory{CodecFactory: scheme.Codecs}
+	restConfig.NegotiatedSerializer = serializer.WithoutConversionCodecFactory{CodecFactory: scheme.Codecs}
 
 	set, err := kubeClient.NewForConfig(restConfig)
 	if err != nil {
@@ -76,14 +82,20 @@ func NewAccessor(kubeConfig string, baseWorkDir string) (*Accessor, error) {
 		return nil, err
 	}
 
+	dynClient, err := dynamic.NewForConfig(restConfig)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create dynamic client: %v", err)
+	}
+
 	return &Accessor{
 		restConfig: restConfig,
 		ctl: &kubectl{
 			kubeConfig: kubeConfig,
 			baseDir:    baseWorkDir,
 		},
-		set:    set,
-		extSet: extSet,
+		set:       set,
+		extSet:    extSet,
+		dynClient: dynClient,
 	}, nil
 }
 
@@ -189,7 +201,7 @@ func (a *Accessor) WaitUntilPodsAreReady(fetchFunc PodFetchFunc, opts ...retry.O
 	return pods, err
 }
 
-// CheckPodsAreReady checks wehther the pods that are selected by the given function is in ready state or not.
+// CheckPodsAreReady checks whether the pods that are selected by the given function is in ready state or not.
 func (a *Accessor) CheckPodsAreReady(fetchFunc PodFetchFunc) ([]kubeApiCore.Pod, error) {
 	scopes.CI.Infof("Checking pods ready...")
 
@@ -234,6 +246,11 @@ func (a *Accessor) WaitUntilPodsAreDeleted(fetchFunc PodFetchFunc, opts ...retry
 	}, newRetryOptions(opts...)...)
 
 	return err
+}
+
+// DeleteDeployment deletes the given deployment.
+func (a *Accessor) DeleteDeployment(ns string, name string) error {
+	return a.set.AppsV1().Deployments(ns).Delete(name, deleteOptionsForeground())
 }
 
 // WaitUntilDeploymentIsReady waits until the deployment with the name/namespace is in ready state.
@@ -311,6 +328,11 @@ func (a *Accessor) WaitUntilServiceEndpointsAreReady(ns string, name string, opt
 	return service, endpoints, nil
 }
 
+// DeleteMutatingWebhook deletes the mutating webhook with the given name.
+func (a *Accessor) DeleteMutatingWebhook(name string) error {
+	return a.set.AdmissionregistrationV1beta1().MutatingWebhookConfigurations().Delete(name, deleteOptionsForeground())
+}
+
 // DeleteValidatingWebhook deletes the validating webhook with the given name.
 func (a *Accessor) DeleteValidatingWebhook(name string) error {
 	return a.set.AdmissionregistrationV1beta1().ValidatingWebhookConfigurations().Delete(name, deleteOptionsForeground())
@@ -334,6 +356,15 @@ func (a *Accessor) WaitForValidatingWebhookDeletion(name string, opts ...retry.O
 func (a *Accessor) ValidatingWebhookConfigurationExists(name string) bool {
 	_, err := a.set.AdmissionregistrationV1beta1().ValidatingWebhookConfigurations().Get(name, kubeApiMeta.GetOptions{})
 	return err == nil
+}
+
+// GetValidatingWebhookConfiguration returns the specified ValidatingWebhookConfiguration.
+func (a *Accessor) GetValidatingWebhookConfiguration(name string) (*kubeApiAdmissions.ValidatingWebhookConfiguration, error) {
+	whc, err := a.set.AdmissionregistrationV1beta1().ValidatingWebhookConfigurations().Get(name, kubeApiMeta.GetOptions{})
+	if err != nil {
+		return nil, fmt.Errorf("could not get validating webhook config: %s", name)
+	}
+	return whc, nil
 }
 
 // GetCustomResourceDefinitions gets the CRDs
@@ -374,6 +405,15 @@ func (a *Accessor) DeleteSecret(namespace, name string) (err error) {
 	return err
 }
 
+func (a *Accessor) GetServiceAccount(namespace string) kubeClientCore.ServiceAccountInterface {
+	return a.set.CoreV1().ServiceAccounts(namespace)
+}
+
+// GetKubernetesVersion returns the Kubernetes server version
+func (a *Accessor) GetKubernetesVersion() (*version.Info, error) {
+	return a.extSet.ServerVersion()
+}
+
 // GetEndpoints returns the endpoints for the given service.
 func (a *Accessor) GetEndpoints(ns, service string, options kubeApiMeta.GetOptions) (*kubeApiCore.Endpoints, error) {
 	return a.set.CoreV1().Endpoints(ns).Get(service, options)
@@ -389,22 +429,25 @@ func (a *Accessor) CreateNamespace(ns string, istioTestingAnnotation string) err
 	return err
 }
 
-func (a *Accessor) CreateNamespaceWithInjectionEnabled(ns string, istioTestingAnnotation string, configNamespace string) error {
-	scopes.Framework.Debugf("Creating namespace with injection enabled: %s", ns)
+// CreateNamespaceWithLabels with the specified name, sidecar-injection behavior, and labels
+func (a *Accessor) CreateNamespaceWithLabels(ns string, istioTestingAnnotation string, labels map[string]string) error {
+	scopes.Framework.Debugf("Creating namespace %s ns with labels %v", ns, labels)
 
-	n := a.newNamespace(ns, istioTestingAnnotation)
-
-	n.ObjectMeta.Labels["istio-injection"] = "enabled"
-
+	n := a.newNamespaceWithLabels(ns, istioTestingAnnotation, labels)
 	_, err := a.set.CoreV1().Namespaces().Create(&n)
 	return err
 }
 
 func (a *Accessor) newNamespace(ns string, istioTestingAnnotation string) kubeApiCore.Namespace {
+	n := a.newNamespaceWithLabels(ns, istioTestingAnnotation, make(map[string]string))
+	return n
+}
+
+func (a *Accessor) newNamespaceWithLabels(ns string, istioTestingAnnotation string, labels map[string]string) kubeApiCore.Namespace {
 	n := kubeApiCore.Namespace{
 		ObjectMeta: kubeApiMeta.ObjectMeta{
 			Name:   ns,
-			Labels: map[string]string{},
+			Labels: labels,
 		},
 	}
 	if istioTestingAnnotation != "" {
@@ -461,14 +504,34 @@ func (a *Accessor) GetNamespace(ns string) (*kubeApiCore.Namespace, error) {
 	return n, nil
 }
 
-// ApplyContents applies the given config contents using kubectl.
-func (a *Accessor) ApplyContents(namespace string, contents string) ([]string, error) {
-	return a.ctl.applyContents(namespace, contents)
+// GetUnstructured returns an unstructured k8s resource object based on the provided schema, namespace, and name.
+func (a *Accessor) GetUnstructured(gvr schema.GroupVersionResource, namespace, name string) (*unstructured.Unstructured, error) {
+	u, err := a.dynClient.Resource(gvr).Namespace(namespace).Get(name, kubeApiMeta.GetOptions{})
+	if err != nil {
+		return nil, fmt.Errorf("failed to get resource %v of type %v: %v", name, gvr, err)
+	}
+
+	return u, nil
 }
 
-// Apply the config in the given filename using kubectl.
+// ApplyContents applies the given config contents using kubectl.
+func (a *Accessor) ApplyContents(namespace string, contents string) ([]string, error) {
+	return a.ctl.applyContents(namespace, contents, false)
+}
+
+// ApplyContentsDryRun applies the given config contents using kubectl with DryRun mode.
+func (a *Accessor) ApplyContentsDryRun(namespace string, contents string) ([]string, error) {
+	return a.ctl.applyContents(namespace, contents, true)
+}
+
+// Apply applies the config in the given filename using kubectl.
 func (a *Accessor) Apply(namespace string, filename string) error {
-	return a.ctl.apply(namespace, filename)
+	return a.ctl.apply(namespace, filename, false)
+}
+
+// ApplyDryRun applies the config in the given filename using kubectl with DryRun mode.
+func (a *Accessor) ApplyDryRun(namespace string, filename string) error {
+	return a.ctl.apply(namespace, filename, true)
 }
 
 // DeleteContents deletes the given config contents using kubectl.
@@ -489,6 +552,11 @@ func (a *Accessor) Logs(namespace string, pod string, container string, previous
 // Exec executes the provided command on the specified pod/container.
 func (a *Accessor) Exec(namespace, pod, container, command string) (string, error) {
 	return a.ctl.exec(namespace, pod, container, command)
+}
+
+// ScaleDeployment scales a deployment to the specified number of replicas.
+func (a *Accessor) ScaleDeployment(namespace, deployment string, replicas int) error {
+	return a.ctl.scale(namespace, deployment, replicas)
 }
 
 // CheckPodReady returns nil if the given pod and all of its containers are ready.

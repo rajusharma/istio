@@ -43,6 +43,13 @@ func maybeAddTLSForDestinationRule(tc *testConfig, templateFile string) string {
 // default (kube service level) to expose ports 80/443. So our gateway specs also expose
 // ports 80/443.
 func TestGateway_HTTPIngress(t *testing.T) {
+	// Skip test if SDS is enabled.
+	// Istio does not support legacy JWTs anymore.
+	// Only Kubernetes 1.12 (beta) and later support trustworthy JWTs.
+	if tc.Kube.AuthSdsEnabled {
+		t.Skipf("Skipping %s: auth_sds_enable=true=true.", t.Name())
+	}
+
 	istioNamespace := tc.Kube.IstioSystemNamespace()
 	ingressGatewayServiceName := tc.Kube.IstioIngressGatewayService()
 
@@ -78,6 +85,13 @@ func TestGateway_HTTPIngress(t *testing.T) {
 }
 
 func TestGateway_HTTPSIngress(t *testing.T) {
+	// Skip test if SDS is enabled.
+	// Istio does not support legacy JWTs anymore.
+	// Only Kubernetes 1.12 (beta) and later support trustworthy JWTs.
+	if tc.Kube.AuthSdsEnabled {
+		t.Skipf("Skipping %s: auth_sds_enable=true=true.", t.Name())
+	}
+
 	istioNamespace := tc.Kube.IstioSystemNamespace()
 	ingressGatewayServiceName := tc.Kube.IstioIngressGatewayService()
 
@@ -113,6 +127,13 @@ func TestGateway_HTTPSIngress(t *testing.T) {
 }
 
 func TestGateway_TCPIngress(t *testing.T) {
+	// Skip test if SDS is enabled.
+	// Istio does not support legacy JWTs anymore.
+	// Only Kubernetes 1.12 (beta) and later support trustworthy JWTs.
+	if tc.Kube.AuthSdsEnabled {
+		t.Skipf("Skipping %s: auth_sds_enable=true=true.", t.Name())
+	}
+
 	istioNamespace := tc.Kube.IstioSystemNamespace()
 	ingressGatewayServiceName := tc.Kube.IstioIngressGatewayService()
 
@@ -132,13 +153,17 @@ func TestGateway_TCPIngress(t *testing.T) {
 
 	for cluster := range tc.Kube.Clusters {
 		runRetriableTest(t, "TCPIngressGateway", defaultRetryBudget, func() error {
-			reqURL := fmt.Sprintf("http://%s.%s:31400/c", ingressGatewayServiceName, istioNamespace)
-			resp := ClientRequest(cluster, "t", reqURL, 100, "--key Host --val uk.bookinfo.com")
 			count := make(map[string]int)
-			for _, elt := range resp.Version {
-				count[elt]++
+			reqURL := fmt.Sprintf("http://%s.%s:31400/c", ingressGatewayServiceName, istioNamespace)
+			// We send request incrementally to avoid overloading sidecar/gateway all at once.
+			for i := 0; i < 10; i++ {
+				resp := ClientRequest(cluster, "t", reqURL, 10, "--key Host --val uk.bookinfo.com")
+				for _, elt := range resp.Version {
+					count[elt]++
+				}
+				log.Infof("request counts %+v", count)
+				time.Sleep(3 * time.Second)
 			}
-			log.Infof("request counts %+v", count)
 			if count["v1"] >= 95 {
 				return nil
 			}
@@ -148,6 +173,13 @@ func TestGateway_TCPIngress(t *testing.T) {
 }
 
 func TestIngressGateway503DuringRuleChange(t *testing.T) {
+	// Skip test if SDS is enabled.
+	// Istio does not support legacy JWTs anymore.
+	// Only Kubernetes 1.12 (beta) and later support trustworthy JWTs.
+	if tc.Kube.AuthSdsEnabled {
+		t.Skipf("Skipping %s: auth_sds_enable=true=true.", t.Name())
+	}
+
 	istioNamespace := tc.Kube.IstioSystemNamespace()
 	ingressGatewayServiceName := tc.Kube.IstioIngressGatewayService()
 
@@ -265,6 +297,13 @@ cleanup:
 }
 
 func TestVirtualServiceMergingAtGateway(t *testing.T) {
+	// Skip test if SDS is enabled.
+	// Istio does not support legacy JWTs anymore.
+	// Only Kubernetes 1.12 (beta) and later support trustworthy JWTs.
+	if tc.Kube.AuthSdsEnabled {
+		t.Skipf("Skipping %s: auth_sds_enable=true=true.", t.Name())
+	}
+
 	istioNamespace := tc.Kube.IstioSystemNamespace()
 	ingressGatewayServiceName := tc.Kube.IstioIngressGatewayService()
 

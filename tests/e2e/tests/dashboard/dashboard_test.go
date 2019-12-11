@@ -49,6 +49,7 @@ const (
 	mixerDashboard       = "install/kubernetes/helm/istio/charts/grafana/dashboards/mixer-dashboard.json"
 	pilotDashboard       = "install/kubernetes/helm/istio/charts/grafana/dashboards/pilot-dashboard.json"
 	galleyDashboard      = "install/kubernetes/helm/istio/charts/grafana/dashboards/galley-dashboard.json"
+	citadelDashboard     = "install/kubernetes/helm/istio/charts/grafana/dashboards/citadel-dashboard.json"
 	fortioYaml           = "tests/e2e/tests/dashboard/fortio-rules.yaml"
 	netcatYaml           = "tests/e2e/tests/dashboard/netcat-rules.yaml"
 
@@ -111,6 +112,10 @@ func performanceQueryFilterFn(queries []string) []string {
 			continue
 		}
 
+		// cAdvisor does not expose this metrics, and we don't have kubelet in kind
+		if strings.Contains(qry, "container_fs_usage_bytes") {
+			continue
+		}
 		ret = append(ret, qry)
 	}
 
@@ -136,6 +141,7 @@ func TestDashboards(t *testing.T) {
 		{"Istio", istioMeshDashboard, func(queries []string) []string { return queries }, nil, "istio-telemetry", 42422},
 		{"Service", serviceDashboard, func(queries []string) []string { return queries }, nil, "istio-telemetry", 42422},
 		{"Workload", workloadDashboard, func(queries []string) []string { return queries }, workloadReplacer, "istio-telemetry", 42422},
+		{"Citadel", citadelDashboard, citadelQueryFilterFn, nil, "istio-citadel", 15014},
 		{"Mixer", mixerDashboard, mixerQueryFilterFn, nil, "istio-telemetry", 15014},
 		{"Pilot", pilotDashboard, pilotQueryFilterFn, nil, "istio-pilot", 15014},
 		{"Galley", galleyDashboard, galleyQueryFilterFn, nil, "istio-galley", 15014},
@@ -158,7 +164,7 @@ func TestDashboards(t *testing.T) {
 				if testCase.customReplacer != nil {
 					modified = testCase.customReplacer.Replace(modified)
 				}
-				value, err := tc.promAPI.Query(context.Background(), modified, time.Now())
+				value, _, err := tc.promAPI.Query(context.Background(), modified, time.Now())
 				if err != nil {
 					t.Errorf("Failure executing query (%s): %v", modified, err)
 				}
@@ -268,6 +274,10 @@ func mixerQueryFilterFn(queries []string) []string {
 		if strings.Contains(query, "grpc_code!=") {
 			continue
 		}
+		// cAdvisor does not expose this metrics, and we don't have kubelet in kind
+		if strings.Contains(query, "container_fs_usage_bytes") {
+			continue
+		}
 		filtered = append(filtered, query)
 	}
 	return filtered
@@ -302,6 +312,18 @@ func pilotQueryFilterFn(queries []string) []string {
 		if strings.Contains(query, "pilot_xds_push_errors") {
 			continue
 		}
+		if strings.Contains(query, "pilot_total_xds_internal_errors") {
+			continue
+		}
+		if strings.Contains(query, "pilot_xds_push_context_errors") {
+			continue
+		}
+		if strings.Contains(query, `pilot_xds_pushes{type!~\"lds|cds|rds|eds\"}`) {
+			continue
+		}
+		if strings.Contains(query, "pilot_xds_eds_instances") {
+			continue
+		}
 		if strings.Contains(query, "_reject") {
 			continue
 		}
@@ -309,6 +331,10 @@ func pilotQueryFilterFn(queries []string) []string {
 			continue
 		}
 		if strings.Contains(query, "_virt_services") {
+			continue
+		}
+		// cAdvisor does not expose this metrics, and we don't have kubelet in kind
+		if strings.Contains(query, "container_fs_usage_bytes") {
 			continue
 		}
 		filtered = append(filtered, query)
@@ -348,6 +374,53 @@ func galleyQueryFilterFn(queries []string) []string {
 		}
 		// This is a frequent source of flakes in e2e-dashboard test. Remove from checked queries for now.
 		if strings.Contains(query, "runtime_strategy_timer_quiesce_reached_total") {
+			continue
+		}
+
+		// Remove this one, as firing of this event requires a hard-to-reproduce set of events.
+		if strings.Contains(query, "runtime_strategy_timer_max_time_reached_total") {
+			continue
+		}
+
+		// cAdvisor does not expose this metrics, and we don't have kubelet in kind
+		if strings.Contains(query, "container_fs_usage_bytes") {
+			continue
+		}
+		filtered = append(filtered, query)
+	}
+	return filtered
+}
+
+func citadelQueryFilterFn(queries []string) []string {
+	filtered := make([]string, 0, len(queries))
+	for _, query := range queries {
+		if strings.Contains(query, "csr_err_count") {
+			continue
+		}
+		if strings.Contains(query, "svc_acc_created_cert_count") {
+			continue
+		}
+		if strings.Contains(query, "acc_deleted_cert_count") {
+			continue
+		}
+		if strings.Contains(query, "secret_deleted_cert_count") {
+			continue
+		}
+		if strings.Contains(query, "server_csr_count") {
+			continue
+		}
+
+		if strings.Contains(query, "success_cert_issuance_count") {
+			continue
+		}
+		if strings.Contains(query, "csr_parsing_err_count") {
+			continue
+		}
+		if strings.Contains(query, "authentication_failure_count") {
+			continue
+		}
+		// cAdvisor does not expose this metrics, and we don't have kubelet in kind
+		if strings.Contains(query, "container_fs_usage_bytes") {
 			continue
 		}
 		filtered = append(filtered, query)
@@ -631,7 +704,7 @@ func metricHasValue(query string) bool {
 }
 
 func metricValue(query string) (float64, error) {
-	value, err := tc.promAPI.Query(context.Background(), query, time.Now())
+	value, _, err := tc.promAPI.Query(context.Background(), query, time.Now())
 	if err != nil || value == nil {
 		return 0, fmt.Errorf("could not retrieve a value for metric '%s': %v", query, err)
 	}

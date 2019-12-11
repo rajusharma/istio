@@ -26,8 +26,9 @@ import (
 )
 
 const (
-	rbacEnableTmpl = "testdata/rbac/v1alpha1/istio-rbac-enable.yaml.tmpl"
-	rbacRulesTmpl  = "testdata/rbac/v1alpha1/istio-rbac-rules.yaml.tmpl"
+	rbacEnableTmpl             = "testdata/rbac/v1alpha1/istio-rbac-enable.yaml.tmpl"
+	rbacRulesTmpl              = "testdata/rbac/v1alpha1/istio-rbac-rules.yaml.tmpl"
+	destinationRuleDisableMtls = "testdata/networking/v1alpha3/destination-rule-no-mtls.yaml"
 )
 
 func setupRbacRules(t *testing.T, rules []string) *deployableConfig {
@@ -59,7 +60,17 @@ func setupRbacRules(t *testing.T, rules []string) *deployableConfig {
 }
 
 func TestRBACForSidecar(t *testing.T) {
-	cfgs := setupRbacRules(t, []string{rbacEnableTmpl, rbacRulesTmpl})
+	// Skip test if SDS is enabled.
+	// Istio does not support legacy JWTs anymore.
+	// Only Kubernetes 1.12 (beta) and later support trustworthy JWTs.
+	if tc.Kube.AuthSdsEnabled {
+		t.Skipf("Skipping %s: auth_sds_enable=true=true.", t.Name())
+	}
+	yamls := []string{rbacEnableTmpl, rbacRulesTmpl}
+	if !tc.Kube.AuthEnabled {
+		yamls = append(yamls, destinationRuleDisableMtls)
+	}
+	cfgs := setupRbacRules(t, yamls)
 	if cfgs != nil {
 		if err := cfgs.Setup(); err != nil {
 			t.Fatal(err)
@@ -176,6 +187,13 @@ func TestRBACForSidecar(t *testing.T) {
 }
 
 func TestRBACForEgressGateway(t *testing.T) {
+	// Skip test if SDS is enabled.
+	// Istio does not support legacy JWTs anymore.
+	// Only Kubernetes 1.12 (beta) and later support trustworthy JWTs.
+	if tc.Kube.AuthSdsEnabled {
+		t.Skipf("Skipping %s: auth_sds_enable=true=true.", t.Name())
+	}
+
 	// Only test when Authentication enabled, otherwise there is no client certificate for the source identity.
 	if !tc.Kube.AuthEnabled {
 		return

@@ -18,23 +18,23 @@ import (
 	"fmt"
 	"log"
 	"os"
-	"os/user"
 	"testing"
 	"time"
 
-	multierror "github.com/hashicorp/go-multierror"
+	"github.com/hashicorp/go-multierror"
 
 	crd "istio.io/istio/pilot/pkg/config/kube/crd/controller"
 	"istio.io/istio/pilot/pkg/model"
 	kube "istio.io/istio/pilot/pkg/serviceregistry/kube/controller"
 	"istio.io/istio/pilot/test/mock"
 	"istio.io/istio/pilot/test/util"
+	"istio.io/istio/pkg/config/schema"
+	"istio.io/istio/pkg/config/schemas"
 )
 
 // Package controller tests the pilot controller using a k8s cluster or standalone apiserver.
 // It needs to be separate from pilot tests - it may interfere with the pilot tests by creating
 // test resources that may confuse other istio tests or it may be confused by other tests.
-// This test can be run in an IDE against local apiserver, if you have run bin/testEnvLocalK8S.sh
 
 // TODO: make changes to k8s ( endpoints in particular ) and verify the proper generation of events.
 // This test relies on mocks.
@@ -43,8 +43,8 @@ const (
 	resync = 1 * time.Second
 )
 
-func makeClient(desc model.ConfigDescriptor) (*crd.Client, error) {
-	cl, err := crd.NewClient("", "", desc, "")
+func makeClient(desc schema.Set) (*crd.Client, error) {
+	cl, err := crd.NewClient("", "", desc, "", &model.DisabledLedger{})
 	if err != nil {
 		return nil, err
 	}
@@ -68,13 +68,11 @@ func resolveConfig(kubeconfig string) (string, error) {
 		kubeconfig = os.Getenv("KUBECONFIG")
 	}
 	if kubeconfig == "" {
-		usr, err := user.Current()
-		if err == nil {
-			defaultCfg := usr.HomeDir + "/.kube/config"
-			_, err := os.Stat(kubeconfig)
-			if err != nil {
-				kubeconfig = defaultCfg
-			}
+		home := os.Getenv("HOME")
+		defaultCfg := home + "/.kube/config"
+		_, err := os.Stat(kubeconfig)
+		if err != nil {
+			kubeconfig = defaultCfg
 		}
 	}
 	if kubeconfig != "" {
@@ -111,7 +109,7 @@ func makeTempClient(t *testing.T) (*crd.Client, string, func()) {
 	if err != nil {
 		t.Fatal(err.Error())
 	}
-	desc := append(model.IstioConfigTypes, mock.Types...)
+	desc := append(schemas.Istio, mock.Types...)
 	cl, err := makeClient(desc)
 	if err != nil {
 		t.Fatalf(err.Error())
@@ -154,7 +152,7 @@ func istioConfig(t *testing.T, client model.ConfigStore, ns string) {
 }
 
 func TestUnknownConfig(t *testing.T) {
-	desc := model.ConfigDescriptor{model.ProtoSchema{
+	desc := schema.Set{schema.Instance{
 		Type:        "unknown-config",
 		Plural:      "unknown-configs",
 		Group:       "test",

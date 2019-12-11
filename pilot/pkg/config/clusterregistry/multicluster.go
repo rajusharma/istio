@@ -20,13 +20,14 @@ import (
 
 	"k8s.io/client-go/kubernetes"
 
-	meshconfig "istio.io/api/mesh/v1alpha1"
+	"istio.io/pkg/log"
+
 	"istio.io/istio/pilot/pkg/model"
-	"istio.io/istio/pilot/pkg/serviceregistry"
 	"istio.io/istio/pilot/pkg/serviceregistry/aggregate"
 	"istio.io/istio/pilot/pkg/serviceregistry/kube/controller"
+	"istio.io/istio/pkg/config/mesh"
+	"istio.io/istio/pkg/config/schemas"
 	"istio.io/istio/pkg/kube/secretcontroller"
-	"istio.io/pkg/log"
 )
 
 type kubeController struct {
@@ -44,29 +45,29 @@ type Multicluster struct {
 
 	m                     sync.Mutex // protects remoteKubeControllers
 	remoteKubeControllers map[string]*kubeController
-	meshNetworks          *meshconfig.MeshNetworks
+	networksWatcher       mesh.NetworksWatcher
 }
 
 // NewMulticluster initializes data structure to store multicluster information
 // It also starts the secret controller
 func NewMulticluster(kc kubernetes.Interface, secretNamespace string,
-	watchedNamespace string, domainSuffix string, resycnPeriod time.Duration,
-	serviceController *aggregate.Controller, xds model.XDSUpdater, meshNetworks *meshconfig.MeshNetworks) (*Multicluster, error) {
+	watchedNamespace string, domainSuffix string, resyncPeriod time.Duration,
+	serviceController *aggregate.Controller, xds model.XDSUpdater, networksWatcher mesh.NetworksWatcher) (*Multicluster, error) {
 
 	remoteKubeController := make(map[string]*kubeController)
-	if resycnPeriod == 0 {
+	if resyncPeriod == 0 {
 		// make sure a resync time of 0 wasn't passed in.
-		resycnPeriod = 30 * time.Second
+		resyncPeriod = 30 * time.Second
 		log.Info("Resync time was configured to 0, resetting to 30")
 	}
 	mc := &Multicluster{
 		WatchedNamespace:      watchedNamespace,
 		DomainSuffix:          domainSuffix,
-		ResyncPeriod:          resycnPeriod,
+		ResyncPeriod:          resyncPeriod,
 		serviceController:     serviceController,
 		XDSUpdater:            xds,
 		remoteKubeControllers: remoteKubeController,
-		meshNetworks:          meshNetworks,
+		networksWatcher:       networksWatcher,
 	}
 
 	err := secretcontroller.StartSecretController(kc,
@@ -91,22 +92,17 @@ func (m *Multicluster) AddMemberCluster(clientset kubernetes.Interface, clusterI
 		DomainSuffix:     m.DomainSuffix,
 		XDSUpdater:       m.XDSUpdater,
 		ClusterID:        clusterID,
+		NetworksWatcher:  m.networksWatcher,
 	})
-	kubectl.InitNetworkLookup(m.meshNetworks)
 
 	remoteKubeController.rc = kubectl
-	m.serviceController.AddRegistry(
-		aggregate.Registry{
-			Name:             serviceregistry.KubernetesRegistry,
-			ClusterID:        clusterID,
-			ServiceDiscovery: kubectl,
-			Controller:       kubectl,
-		})
+	m.serviceController.AddRegistry(kubectl)
 
 	m.remoteKubeControllers[clusterID] = &remoteKubeController
 	m.m.Unlock()
-	_ = kubectl.AppendServiceHandler(func(*model.Service, model.Event) { m.XDSUpdater.ConfigUpdate(true) })
-	_ = kubectl.AppendInstanceHandler(func(*model.ServiceInstance, model.Event) { m.XDSUpdater.ConfigUpdate(true) })
+
+	_ = kubectl.AppendServiceHandler(func(*model.Service, model.Event) { m.updateHandler() })
+	_ = kubectl.AppendInstanceHandler(func(*model.ServiceInstance, model.Event) { m.updateHandler() })
 	go kubectl.Run(stopCh)
 	return nil
 }
@@ -126,8 +122,18 @@ func (m *Multicluster) DeleteMemberCluster(clusterID string) error {
 	close(m.remoteKubeControllers[clusterID].stopCh)
 	delete(m.remoteKubeControllers, clusterID)
 	if m.XDSUpdater != nil {
-		m.XDSUpdater.ConfigUpdate(true)
+		m.XDSUpdater.ConfigUpdate(&model.PushRequest{Full: true})
 	}
 
 	return nil
+}
+
+func (m *Multicluster) updateHandler() {
+	if m.XDSUpdater != nil {
+		req := &model.PushRequest{
+			Full:               true,
+			ConfigTypesUpdated: map[string]struct{}{schemas.ServiceEntry.Type: {}},
+		}
+		m.XDSUpdater.ConfigUpdate(req)
+	}
 }

@@ -19,6 +19,8 @@ import (
 	"testing"
 	"time"
 
+	"go.opencensus.io/stats/view"
+
 	authn "istio.io/api/authentication/v1alpha1"
 	"istio.io/istio/pilot/pkg/model/test"
 )
@@ -122,6 +124,27 @@ func TestSetAuthenticationPolicyJwksURIs(t *testing.T) {
 			},
 			PrincipalBinding: authn.PrincipalBinding_USE_ORIGIN,
 		},
+		"jwks": {
+			Targets: []*authn.TargetSelector{{
+				Name: "two",
+				Ports: []*authn.PortSelector{
+					{
+						Port: &authn.PortSelector_Number{
+							Number: 80,
+						},
+					},
+				},
+			}},
+			Origins: []*authn.OriginAuthenticationMethod{
+				{
+					Jwt: &authn.Jwt{
+						Issuer: "http://abc",
+						Jwks:   "JSONWebKeySet",
+					},
+				},
+			},
+			PrincipalBinding: authn.PrincipalBinding_USE_ORIGIN,
+		},
 	}
 
 	cases := []struct {
@@ -135,6 +158,10 @@ func TestSetAuthenticationPolicyJwksURIs(t *testing.T) {
 		{
 			in:       authNPolicies["two"],
 			expected: "http://xyz",
+		},
+		{
+			in:       authNPolicies["jwks"],
+			expected: "",
 		},
 	}
 	for _, c := range cases {
@@ -184,6 +211,60 @@ func TestGetPublicKey(t *testing.T) {
 	// Verify mock server http://localhost:9999/oauth2/v3/certs was only called once because of the cache.
 	if got, want := ms.PubKeyHitNum, uint64(1); got != want {
 		t.Errorf("Mock server Hit number => expected %d but got %d", want, got)
+	}
+}
+
+func TestGetPublicKeyUsingTLS(t *testing.T) {
+	r := newJwksResolverWithCABundlePaths(JwtPubKeyEvictionDuration, JwtPubKeyRefreshInterval, []string{"./test/testcert/cert.pem"})
+	defer r.Close()
+
+	ms, err := test.StartNewTLSServer("./test/testcert/cert.pem", "./test/testcert/key.pem")
+	defer ms.Stop()
+	if err != nil {
+		t.Fatal("failed to start a mock server")
+	}
+
+	mockCertURL := ms.URL + "/oauth2/v3/certs"
+	pk, err := r.GetPublicKey(mockCertURL)
+	if err != nil {
+		t.Errorf("GetPublicKey(%+v) fails: expected no error, got (%v)", mockCertURL, err)
+	}
+	if test.JwtPubKey1 != pk {
+		t.Errorf("GetPublicKey(%+v): expected (%s), got (%s)", mockCertURL, test.JwtPubKey1, pk)
+	}
+}
+
+func TestGetPublicKeyUsingTLSBadCert(t *testing.T) {
+	r := newJwksResolverWithCABundlePaths(JwtPubKeyEvictionDuration, JwtPubKeyRefreshInterval, []string{"./test/testcert/cert2.pem"})
+	defer r.Close()
+
+	ms, err := test.StartNewTLSServer("./test/testcert/cert.pem", "./test/testcert/key.pem")
+	defer ms.Stop()
+	if err != nil {
+		t.Fatal("failed to start a mock server")
+	}
+
+	mockCertURL := ms.URL + "/oauth2/v3/certs"
+	_, err = r.GetPublicKey(mockCertURL)
+	if err == nil {
+		t.Errorf("GetPublicKey(%+v) did not fail: expected bad certificate error, got no error", mockCertURL)
+	}
+}
+
+func TestGetPublicKeyUsingTLSWithoutCABundles(t *testing.T) {
+	r := newJwksResolverWithCABundlePaths(JwtPubKeyEvictionDuration, JwtPubKeyRefreshInterval, []string{})
+	defer r.Close()
+
+	ms, err := test.StartNewTLSServer("./test/testcert/cert.pem", "./test/testcert/key.pem")
+	defer ms.Stop()
+	if err != nil {
+		t.Fatal("failed to start a mock server")
+	}
+
+	mockCertURL := ms.URL + "/oauth2/v3/certs"
+	_, err = r.GetPublicKey(mockCertURL)
+	if err == nil {
+		t.Errorf("GetPublicKey(%+v) did not fail: expected https unsupported error, got no error", mockCertURL)
 	}
 }
 
@@ -291,6 +372,63 @@ func TestJwtPubKeyRefreshWithNetworkError(t *testing.T) {
 
 	// The lastRefreshedTime should not change the refresh failed due to network error.
 	verifyKeyLastRefreshedTime(t, r, ms, false /* wantChanged */)
+}
+
+func getCounterValue(counterName string, t *testing.T) float64 {
+	counterValue := 0.0
+	if data, err := view.RetrieveData(counterName); err == nil {
+		if len(data) != 0 {
+			counterValue = data[0].Data.(*view.SumData).Value
+		}
+	} else {
+		t.Fatalf("failed to get value for counter %s: %v", counterName, err)
+	}
+	return counterValue
+}
+
+func TestJwtPubKeyMetric(t *testing.T) {
+	r := NewJwksResolver(JwtPubKeyEvictionDuration, JwtPubKeyRefreshInterval)
+	defer r.Close()
+
+	ms, err := test.StartNewServer()
+	defer ms.Stop()
+	if err != nil {
+		t.Fatal("failed to start a mock server")
+	}
+	ms.ReturnErrorForFirstNumHits = 1
+
+	successValueBefore := getCounterValue(networkFetchSuccessCounter.Name(), t)
+	failValueBefore := getCounterValue(networkFetchFailCounter.Name(), t)
+
+	mockCertURL := ms.URL + "/oauth2/v3/certs"
+	cases := []struct {
+		in                string
+		expectedJwtPubkey string
+	}{
+		{
+			in:                mockCertURL,
+			expectedJwtPubkey: "",
+		},
+		{
+			in:                mockCertURL,
+			expectedJwtPubkey: test.JwtPubKey1,
+		},
+	}
+	for _, c := range cases {
+		pk, _ := r.GetPublicKey(c.in)
+		if c.expectedJwtPubkey != pk {
+			t.Errorf("GetPublicKey(%+v): expected (%s), got (%s)", c.in, c.expectedJwtPubkey, pk)
+		}
+	}
+
+	successValueAfter := getCounterValue(networkFetchSuccessCounter.Name(), t)
+	failValueAfter := getCounterValue(networkFetchFailCounter.Name(), t)
+	if successValueBefore >= successValueAfter {
+		t.Errorf("the success counter is not incremented")
+	}
+	if failValueBefore >= failValueAfter {
+		t.Errorf("the fail counter is not incremented")
+	}
 }
 
 func startMockServer(t *testing.T) *test.MockOpenIDDiscoveryServer {

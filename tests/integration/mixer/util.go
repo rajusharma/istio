@@ -25,6 +25,8 @@ import (
 	"fortio.org/fortio/fhttp"
 	"fortio.org/fortio/periodic"
 
+	"istio.io/istio/pkg/test/util/retry"
+
 	"istio.io/istio/pkg/test/framework/components/ingress"
 	"istio.io/istio/pkg/test/framework/components/namespace"
 	"istio.io/istio/pkg/test/framework/components/prometheus"
@@ -78,10 +80,13 @@ func VisitProductPage(ing ingress.Instance, timeout time.Duration, wantStatus in
 }
 
 func ValidateMetric(t *testing.T, prometheus prometheus.Instance, query, metricName string, want float64) {
-	got, err := getMetric(t, prometheus, query, metricName)
-	if err != nil {
-		t.Fatalf("%v", err)
-	}
+	var got float64
+	retry.UntilSuccessOrFail(t, func() error {
+		var err error
+		got, err = getMetric(t, prometheus, query, metricName)
+		return err
+	})
+
 	t.Logf("%s: %f", metricName, got)
 	if got < want {
 		t.Logf("prometheus values for %s:\n%s", metricName, PromDump(prometheus, metricName))
@@ -132,7 +137,8 @@ func PromDumpWithAttributes(prometheus prometheus.Instance, metric string, attri
 func SendTraffic(ingress ingress.Instance, t *testing.T, msg, url, extraHeader string, calls int64) *fhttp.HTTPRunnerResults {
 	t.Log(msg)
 	if url == "" {
-		url = fmt.Sprintf("%s/productpage", ingress.HTTPAddress())
+		addr := ingress.HTTPAddress()
+		url = fmt.Sprintf("http://%s/productpage", addr.String())
 	}
 
 	// run at a high enough QPS (here 10) to ensure that enough
@@ -188,7 +194,8 @@ func GetAndValidateAccessLog(ns namespace.Instance, t *testing.T, labelSelector,
 	}
 
 	retryFn := func(_ context.Context, i int) error {
-		content, err := shell.Execute(false, "kubectl logs -n %s -l %s -c %s ",
+		// Different kubectl versions seem to return different amounts of logs. To ensure we get them all, set tail to a large number
+		content, err := shell.Execute(false, "kubectl logs -n %s -l %s -c %s --tail=10000000",
 			ns.Name(), labelSelector, container)
 		if err != nil {
 			return fmt.Errorf("unable to get access logs from mixer: %v , content %v", err, content)

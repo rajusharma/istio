@@ -23,6 +23,8 @@ function usage() {
   echo ''
   # shellcheck disable=SC2016
   echo '  -p: Specify the envoy port to which redirect all TCP traffic (default $ENVOY_PORT = 15001)'
+  # shellcheck disable=SC2016
+  echo '  -z: Port to which all inbound TCP traffic to the pod/VM should be redirected to. For REDIRECT only (default $INBOUND_CAPTURE_PORT = 15006)'
   echo '  -u: Specify the UID of the user for which the redirection is not'
   echo '      applied. Typically, this is the UID of the proxy container'
   # shellcheck disable=SC2016
@@ -50,6 +52,7 @@ function usage() {
   echo '  -k: Comma separated list of virtual interfaces whose inbound traffic (from VM)'
   echo '      will be treated as outbound (optional)'
   echo '  -t: Unit testing, only functions are loaded and no other instructions are executed.'
+  echo '  -h: Displays usage information and exits.'
   # shellcheck disable=SC2016
   echo ''
 }
@@ -69,7 +72,7 @@ function isValidIP() {
    fi
 }
 #
-# Function return true if agrument is a valid ipv4 address
+# Function return true if argument is a valid ipv4 address
 #
 function isIPv4() {
    local ipv4regexp="^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$"
@@ -80,7 +83,7 @@ function isIPv4() {
   fi
 }
 #
-# Function return true if agrument is a valid ipv6 address
+# Function return true if argument is a valid ipv6 address
 #
 function isIPv6() {
   local ipv6section="^[0-9a-fA-F]{1,4}$"
@@ -122,6 +125,7 @@ IFS=,
 # Ideally we should generate ufw (and similar) configs as well, in case user already has an iptables solution.
 
 PROXY_PORT=${ENVOY_PORT:-15001}
+PROXY_INBOUND_CAPTURE_PORT=${INBOUND_CAPTURE_PORT:-15006}
 PROXY_UID=
 PROXY_GID=
 INBOUND_INTERCEPTION_MODE=${ISTIO_INBOUND_INTERCEPTION_MODE}
@@ -134,10 +138,13 @@ OUTBOUND_IP_RANGES_EXCLUDE=${ISTIO_SERVICE_EXCLUDE_CIDR-}
 OUTBOUND_PORTS_EXCLUDE=${ISTIO_LOCAL_OUTBOUND_PORTS_EXCLUDE-}
 KUBEVIRT_INTERFACES=
 
-while getopts ":p:u:g:m:b:d:o:i:x:k:h:t" opt; do
+while getopts ":p:z:u:g:m:b:d:o:i:x:k:ht" opt; do
   case ${opt} in
     p)
       PROXY_PORT=${OPTARG}
+      ;;
+    z)
+      PROXY_INBOUND_CAPTURE_PORT=${OPTARG}
       ;;
     u)
       PROXY_UID=${OPTARG}
@@ -248,38 +255,11 @@ else
     done
 fi
 
-# Remove the old chains, to generate new configs.
-iptables -t nat -D PREROUTING -p tcp -j ISTIO_INBOUND 2>/dev/null
-iptables -t mangle -D PREROUTING -p tcp -j ISTIO_INBOUND 2>/dev/null
-iptables -t nat -D OUTPUT -p tcp -j ISTIO_OUTPUT 2>/dev/null
-
-# Flush and delete the istio chains.
-iptables -t nat -F ISTIO_OUTPUT 2>/dev/null
-iptables -t nat -X ISTIO_OUTPUT 2>/dev/null
-iptables -t nat -F ISTIO_INBOUND 2>/dev/null
-iptables -t nat -X ISTIO_INBOUND 2>/dev/null
-iptables -t mangle -F ISTIO_INBOUND 2>/dev/null
-iptables -t mangle -X ISTIO_INBOUND 2>/dev/null
-iptables -t mangle -F ISTIO_DIVERT 2>/dev/null
-iptables -t mangle -X ISTIO_DIVERT 2>/dev/null
-iptables -t mangle -F ISTIO_TPROXY 2>/dev/null
-iptables -t mangle -X ISTIO_TPROXY 2>/dev/null
-
-# Must be last, the others refer to it
-iptables -t nat -F ISTIO_REDIRECT 2>/dev/null
-iptables -t nat -X ISTIO_REDIRECT 2>/dev/null
-iptables -t nat -F ISTIO_IN_REDIRECT 2>/dev/null
-iptables -t nat -X ISTIO_IN_REDIRECT 2>/dev/null
-
-if [ "${1:-}" = "clean" ]; then
-  echo "Only cleaning, no new rules added"
-  exit 0
-fi
-
 # Dump out our environment for debugging purposes.
 echo "Environment:"
 echo "------------"
 echo "ENVOY_PORT=${ENVOY_PORT-}"
+echo "INBOUND_CAPTURE_PORT=${INBOUND_CAPTURE_PORT-}"
 echo "ISTIO_INBOUND_INTERCEPTION_MODE=${ISTIO_INBOUND_INTERCEPTION_MODE-}"
 echo "ISTIO_INBOUND_TPROXY_MARK=${ISTIO_INBOUND_TPROXY_MARK-}"
 echo "ISTIO_INBOUND_TPROXY_ROUTE_TABLE=${ISTIO_INBOUND_TPROXY_ROUTE_TABLE-}"
@@ -291,7 +271,7 @@ echo
 echo "Variables:"
 echo "----------"
 echo "PROXY_PORT=${PROXY_PORT}"
-echo "INBOUND_CAPTURE_PORT=${INBOUND_CAPTURE_PORT:-$PROXY_PORT}"
+echo "PROXY_INBOUND_CAPTURE_PORT=${PROXY_INBOUND_CAPTURE_PORT}"
 echo "PROXY_UID=${PROXY_UID}"
 echo "INBOUND_INTERCEPTION_MODE=${INBOUND_INTERCEPTION_MODE}"
 echo "INBOUND_TPROXY_MARK=${INBOUND_TPROXY_MARK}"
@@ -305,7 +285,14 @@ echo "KUBEVIRT_INTERFACES=${KUBEVIRT_INTERFACES}"
 echo "ENABLE_INBOUND_IPV6=${ENABLE_INBOUND_IPV6}"
 echo
 
-INBOUND_CAPTURE_PORT=${INBOUND_CAPTURE_PORT:-$PROXY_PORT}
+
+set +o nounset
+# Blindly add a ipv6 address. If it fails it's fine.
+# Add local ipv6 address to lo. Used in redirecting unknown ipv6 traffic to original dst.
+# This address does not show up in neigh table so each Pod/Vm will only see its own. Think about 127.0.0.6.
+if [ -n "${ENABLE_INBOUND_IPV6}" ]; then
+  ip -6 addr add ::6/128 dev lo
+fi
 
 set -o errexit
 set -o nounset
@@ -321,7 +308,13 @@ iptables -t nat -A ISTIO_REDIRECT -p tcp -j REDIRECT --to-port "${PROXY_PORT}"
 # Use this chain also for redirecting inbound traffic to the common Envoy port
 # when not using TPROXY.
 iptables -t nat -N ISTIO_IN_REDIRECT
-iptables -t nat -A ISTIO_IN_REDIRECT -p tcp -j REDIRECT --to-port "${INBOUND_CAPTURE_PORT}"
+
+# PROXY_INBOUND_CAPTURE_PORT should be used only user explicitly set INBOUND_PORTS_INCLUDE to capture all
+if [ "${INBOUND_PORTS_INCLUDE}" == "*" ]; then
+  iptables -t nat -A ISTIO_IN_REDIRECT -p tcp -j REDIRECT --to-port "${PROXY_INBOUND_CAPTURE_PORT}"
+else
+  iptables -t nat -A ISTIO_IN_REDIRECT -p tcp -j REDIRECT --to-port "${PROXY_PORT}"
+fi
 
 # Handling of inbound ports. Traffic will be redirected to Envoy, which will process and forward
 # to the local service. If not set, no inbound port will be intercepted by istio iptables.
@@ -407,10 +400,13 @@ if [ -n "${OUTBOUND_PORTS_EXCLUDE}" ]; then
   done
 fi
 
+# 127.0.0.6 is bind connect from inbound passthrough cluster
+iptables -t nat -A ISTIO_OUTPUT -o lo -s 127.0.0.6/32 -j RETURN
+
 if [ -z "${DISABLE_REDIRECTION_ON_LOCAL_LOOPBACK-}" ]; then
   # Redirect app calls back to itself via Envoy when using the service VIP or endpoint
   # address, e.g. appN => Envoy (client) => Envoy (server) => appN.
-  iptables -t nat -A ISTIO_OUTPUT -o lo ! -d 127.0.0.1/32 -j ISTIO_REDIRECT
+  iptables -t nat -A ISTIO_OUTPUT -o lo ! -d 127.0.0.1/32 -j ISTIO_IN_REDIRECT
 fi
 
 for uid in ${PROXY_UID}; do
@@ -465,29 +461,6 @@ fi
 # If ENABLE_INBOUND_IPV6 is unset (default unset), restrict IPv6 traffic.
 set +o nounset
 if [ -n "${ENABLE_INBOUND_IPV6}" ]; then
-  # Remove the old chains, to generate new configs.
-  ip6tables -t nat -D PREROUTING -p tcp -j ISTIO_INBOUND 2>/dev/null || true
-  ip6tables -t mangle -D PREROUTING -p tcp -j ISTIO_INBOUND 2>/dev/null || true
-  ip6tables -t nat -D OUTPUT -p tcp -j ISTIO_OUTPUT 2>/dev/null || true
-
-  # Flush and delete the istio chains.
-  ip6tables -t nat -F ISTIO_OUTPUT 2>/dev/null || true
-  ip6tables -t nat -X ISTIO_OUTPUT 2>/dev/null || true
-  ip6tables -t nat -F ISTIO_INBOUND 2>/dev/null || true
-  ip6tables -t nat -X ISTIO_INBOUND 2>/dev/null || true
-  ip6tables -t mangle -F ISTIO_INBOUND 2>/dev/null || true
-  ip6tables -t mangle -X ISTIO_INBOUND 2>/dev/null || true
-  ip6tables -t mangle -F ISTIO_DIVERT 2>/dev/null || true
-  ip6tables -t mangle -X ISTIO_DIVERT 2>/dev/null || true
-  ip6tables -t mangle -F ISTIO_TPROXY 2>/dev/null || true
-  ip6tables -t mangle -X ISTIO_TPROXY 2>/dev/null || true
-
-  # Must be last, the others refer to it
-  ip6tables -t nat -F ISTIO_REDIRECT 2>/dev/null || true
-  ip6tables -t nat -X ISTIO_REDIRECT 2>/dev/null|| true
-  ip6tables -t nat -F ISTIO_IN_REDIRECT 2>/dev/null || true
-  ip6tables -t nat -X ISTIO_IN_REDIRECT 2>/dev/null || true
-
   # Create a new chain for redirecting outbound traffic to the common Envoy port.
   # In both chains, '-j RETURN' bypasses Envoy and '-j ISTIO_REDIRECT'
   # redirects to Envoy.
@@ -497,7 +470,12 @@ if [ -n "${ENABLE_INBOUND_IPV6}" ]; then
   # Use this chain also for redirecting inbound traffic to the common Envoy port
   # when not using TPROXY.
   ip6tables -t nat -N ISTIO_IN_REDIRECT
-  ip6tables -t nat -A ISTIO_IN_REDIRECT -p tcp -j REDIRECT --to-port "${INBOUND_CAPTURE_PORT}"
+  # PROXY_INBOUND_CAPTURE_PORT should be used only user explicitly set INBOUND_PORTS_INCLUDE to capture all
+  if [ "${INBOUND_PORTS_INCLUDE}" == "*" ]; then
+    ip6tables -t nat -A ISTIO_IN_REDIRECT -p tcp -j REDIRECT --to-port "${PROXY_INBOUND_CAPTURE_PORT}"
+  else
+    ip6tables -t nat -A ISTIO_IN_REDIRECT -p tcp -j REDIRECT --to-port "${PROXY_PORT}"
+  fi
 
   # Handling of inbound ports. Traffic will be redirected to Envoy, which will process and forward
   # to the local service. If not set, no inbound port will be intercepted by istio iptables.
@@ -515,6 +493,8 @@ if [ -n "${ENABLE_INBOUND_IPV6}" ]; then
             ip6tables -t ${table} -A ISTIO_INBOUND -p tcp --dport "${port}" -j RETURN
         done
         fi
+        # Redirect other inbound traffic
+        ip6tables -t ${table} -A ISTIO_INBOUND -p tcp -j ISTIO_IN_REDIRECT
     else
         # User has specified a non-empty list of ports to be redirected to Envoy.
         for port in ${INBOUND_PORTS_INCLUDE}; do
@@ -537,9 +517,12 @@ if [ -n "${ENABLE_INBOUND_IPV6}" ]; then
     done
   fi
 
+  # ::6 is bind when connect from inbound passthrough cluster
+  ip6tables -t nat -A ISTIO_OUTPUT -o lo -s ::6/128 -j RETURN
+
   # Redirect app calls to back itself via Envoy when using the service VIP or endpoint
   # address, e.g. appN => Envoy (client) => Envoy (server) => appN.
-  ip6tables -t nat -A ISTIO_OUTPUT -o lo ! -d ::1/128 -j ISTIO_REDIRECT
+  ip6tables -t nat -A ISTIO_OUTPUT -o lo ! -d ::1/128 -j ISTIO_IN_REDIRECT
 
   for uid in ${PROXY_UID}; do
     # Avoid infinite loops. Don't redirect Envoy traffic directly back to
@@ -586,8 +569,8 @@ if [ -n "${ENABLE_INBOUND_IPV6}" ]; then
   fi
 else
   # Drop all inbound traffic except established connections.
-  ip6tables -F INPUT || true
-  ip6tables -A INPUT -m state --state ESTABLISHED -j ACCEPT || true
-  ip6tables -A INPUT -i lo -d ::1 -j ACCEPT || true
-  ip6tables -A INPUT -j REJECT || true
+  ip6tables -t filter -F INPUT || true
+  ip6tables -t filter -A INPUT -m state --state ESTABLISHED -j ACCEPT || true
+  ip6tables -t filter -A INPUT -i lo -d ::1 -j ACCEPT || true
+  ip6tables -t filter -A INPUT -j REJECT || true
 fi

@@ -20,14 +20,19 @@ import (
 	"testing"
 
 	networking "istio.io/api/networking/v1alpha3"
+
 	"istio.io/istio/pilot/pkg/config/memory"
 	"istio.io/istio/pilot/pkg/model"
+	"istio.io/istio/pkg/config/constants"
+	"istio.io/istio/pkg/config/host"
+	"istio.io/istio/pkg/config/labels"
+	"istio.io/istio/pkg/config/schemas"
 )
 
 func createServiceEntries(configs []*model.Config, store model.IstioConfigStore, t *testing.T) {
 	t.Helper()
-	for _, config := range configs {
-		_, err := store.Create(*config)
+	for _, cfg := range configs {
+		_, err := store.Create(*cfg)
 		if err != nil {
 			t.Errorf("error occurred crearting ServiceEntry config: %v", err)
 		}
@@ -37,15 +42,33 @@ func createServiceEntries(configs []*model.Config, store model.IstioConfigStore,
 type channelTerminal struct {
 }
 
+// FakeXdsUpdater is used to test the event handlers.
+type FakeXdsUpdater struct {
+}
+
+func (fx *FakeXdsUpdater) EDSUpdate(shard, hostname string, namespace string, entry []*model.IstioEndpoint) error {
+	return nil
+}
+
+func (fx *FakeXdsUpdater) ConfigUpdate(*model.PushRequest) {
+}
+
+func (fx *FakeXdsUpdater) ProxyUpdate(clusterID, ip string) {
+}
+
+func (fx *FakeXdsUpdater) SvcUpdate(shard, hostname string, namespace string, event model.Event) {
+}
+
 func initServiceDiscovery() (model.IstioConfigStore, *ServiceEntryStore, func()) {
-	store := memory.Make(model.IstioConfigTypes)
+	store := memory.Make(schemas.Istio)
 	configController := memory.NewController(store)
 
 	stop := make(chan struct{})
 	go configController.Run(stop)
 
 	istioStore := model.MakeIstioStore(configController)
-	serviceController := NewServiceDiscovery(configController, istioStore)
+	xdsUpdater := &FakeXdsUpdater{}
+	serviceController := NewServiceDiscovery(configController, istioStore, xdsUpdater)
 	return istioStore, serviceController, func() {
 		stop <- channelTerminal{}
 	}
@@ -56,7 +79,7 @@ func TestServiceDiscoveryServices(t *testing.T) {
 	defer stopFn()
 
 	expectedServices := []*model.Service{
-		makeService("*.google.com", "httpDNS", model.UnspecifiedIP, map[string]int{"http-port": 80, "http-alt-port": 8080}, true, model.DNSLB),
+		makeService("*.google.com", "httpDNS", constants.UnspecifiedIP, map[string]int{"http-port": 80, "http-alt-port": 8080}, true, model.DNSLB),
 		makeService("tcpstatic.com", "tcpStatic", "172.217.0.1", map[string]int{"tcp-444": 444}, true, model.ClientSideLB),
 	}
 
@@ -74,7 +97,7 @@ func TestServiceDiscoveryServices(t *testing.T) {
 }
 
 func TestServiceDiscoveryGetService(t *testing.T) {
-	host := "*.google.com"
+	hostname := "*.google.com"
 	hostDNE := "does.not.exist.local"
 
 	store, sd, stopFn := initServiceDiscovery()
@@ -82,7 +105,7 @@ func TestServiceDiscoveryGetService(t *testing.T) {
 
 	createServiceEntries([]*model.Config{httpDNS, tcpStatic}, store, t)
 
-	service, err := sd.GetService(model.Hostname(hostDNE))
+	service, err := sd.GetService(host.Name(hostDNE))
 	if err != nil {
 		t.Errorf("GetService() encountered unexpected error: %v", err)
 	}
@@ -90,15 +113,15 @@ func TestServiceDiscoveryGetService(t *testing.T) {
 		t.Errorf("GetService(%q) => should not exist, got %s", hostDNE, service.Hostname)
 	}
 
-	service, err = sd.GetService(model.Hostname(host))
+	service, err = sd.GetService(host.Name(hostname))
 	if err != nil {
-		t.Errorf("GetService(%q) encountered unexpected error: %v", host, err)
+		t.Errorf("GetService(%q) encountered unexpected error: %v", hostname, err)
 	}
 	if service == nil {
-		t.Errorf("GetService(%q) => should exist", host)
+		t.Errorf("GetService(%q) => should exist", hostname)
 	}
-	if service.Hostname != model.Hostname(host) {
-		t.Errorf("GetService(%q) => %q, want %q", host, service.Hostname, host)
+	if service.Hostname != host.Name(hostname) {
+		t.Errorf("GetService(%q) => %q, want %q", hostname, service.Hostname, hostname)
 	}
 }
 
@@ -109,9 +132,9 @@ func TestServiceDiscoveryGetProxyServiceInstances(t *testing.T) {
 	createServiceEntries([]*model.Config{httpStatic, tcpStatic}, store, t)
 
 	expectedInstances := []*model.ServiceInstance{
-		makeInstance(httpStatic, "2.2.2.2", 7080, httpStatic.Spec.(*networking.ServiceEntry).Ports[0], nil),
-		makeInstance(httpStatic, "2.2.2.2", 18080, httpStatic.Spec.(*networking.ServiceEntry).Ports[1], nil),
-		makeInstance(tcpStatic, "2.2.2.2", 444, tcpStatic.Spec.(*networking.ServiceEntry).Ports[0], nil),
+		makeInstance(httpStatic, "2.2.2.2", 7080, httpStatic.Spec.(*networking.ServiceEntry).Ports[0], nil, true),
+		makeInstance(httpStatic, "2.2.2.2", 18080, httpStatic.Spec.(*networking.ServiceEntry).Ports[1], nil, true),
+		makeInstance(tcpStatic, "2.2.2.2", 444, tcpStatic.Spec.(*networking.ServiceEntry).Ports[0], nil, true),
 	}
 
 	instances, err := sd.GetProxyServiceInstances(&model.Proxy{IPAddresses: []string{"2.2.2.2"}})
@@ -133,15 +156,16 @@ func TestServiceDiscoveryInstances(t *testing.T) {
 	createServiceEntries([]*model.Config{httpDNS, tcpStatic}, store, t)
 
 	expectedInstances := []*model.ServiceInstance{
-		makeInstance(httpDNS, "us.google.com", 7080, httpDNS.Spec.(*networking.ServiceEntry).Ports[0], nil),
-		makeInstance(httpDNS, "us.google.com", 18080, httpDNS.Spec.(*networking.ServiceEntry).Ports[1], nil),
-		makeInstance(httpDNS, "uk.google.com", 1080, httpDNS.Spec.(*networking.ServiceEntry).Ports[0], nil),
-		makeInstance(httpDNS, "uk.google.com", 8080, httpDNS.Spec.(*networking.ServiceEntry).Ports[1], nil),
-		makeInstance(httpDNS, "de.google.com", 80, httpDNS.Spec.(*networking.ServiceEntry).Ports[0], map[string]string{"foo": "bar"}),
-		makeInstance(httpDNS, "de.google.com", 8080, httpDNS.Spec.(*networking.ServiceEntry).Ports[1], map[string]string{"foo": "bar"}),
+		makeInstance(httpDNS, "us.google.com", 7080, httpDNS.Spec.(*networking.ServiceEntry).Ports[0], nil, true),
+		makeInstance(httpDNS, "us.google.com", 18080, httpDNS.Spec.(*networking.ServiceEntry).Ports[1], nil, true),
+		makeInstance(httpDNS, "uk.google.com", 1080, httpDNS.Spec.(*networking.ServiceEntry).Ports[0], nil, true),
+		makeInstance(httpDNS, "uk.google.com", 8080, httpDNS.Spec.(*networking.ServiceEntry).Ports[1], nil, true),
+		makeInstance(httpDNS, "de.google.com", 80, httpDNS.Spec.(*networking.ServiceEntry).Ports[0], map[string]string{"foo": "bar"}, true),
+		makeInstance(httpDNS, "de.google.com", 8080, httpDNS.Spec.(*networking.ServiceEntry).Ports[1], map[string]string{"foo": "bar"}, true),
 	}
 
-	instances, err := sd.InstancesByPort("*.google.com", 0, nil)
+	svc := convertServices(*httpDNS)
+	instances, err := sd.InstancesByPort(svc[0], 0, nil)
 	if err != nil {
 		t.Errorf("Instances() encountered unexpected error: %v", err)
 	}
@@ -160,12 +184,13 @@ func TestServiceDiscoveryInstances1Port(t *testing.T) {
 	createServiceEntries([]*model.Config{httpDNS, tcpStatic}, store, t)
 
 	expectedInstances := []*model.ServiceInstance{
-		makeInstance(httpDNS, "us.google.com", 7080, httpDNS.Spec.(*networking.ServiceEntry).Ports[0], nil),
-		makeInstance(httpDNS, "uk.google.com", 1080, httpDNS.Spec.(*networking.ServiceEntry).Ports[0], nil),
-		makeInstance(httpDNS, "de.google.com", 80, httpDNS.Spec.(*networking.ServiceEntry).Ports[0], map[string]string{"foo": "bar"}),
+		makeInstance(httpDNS, "us.google.com", 7080, httpDNS.Spec.(*networking.ServiceEntry).Ports[0], nil, true),
+		makeInstance(httpDNS, "uk.google.com", 1080, httpDNS.Spec.(*networking.ServiceEntry).Ports[0], nil, true),
+		makeInstance(httpDNS, "de.google.com", 80, httpDNS.Spec.(*networking.ServiceEntry).Ports[0], map[string]string{"foo": "bar"}, true),
 	}
 
-	instances, err := sd.InstancesByPort("*.google.com", 80, nil)
+	svc := convertServices(*httpDNS)
+	instances, err := sd.InstancesByPort(svc[0], 80, nil)
 	if err != nil {
 		t.Errorf("Instances() encountered unexpected error: %v", err)
 	}
@@ -181,9 +206,9 @@ func TestNonServiceConfig(t *testing.T) {
 	defer stopFn()
 
 	// Create a non-service configuration element. This should not affect the service registry at all.
-	config := model.Config{
+	cfg := model.Config{
 		ConfigMeta: model.ConfigMeta{
-			Type:              model.DestinationRule.Type,
+			Type:              schemas.DestinationRule.Type,
 			Name:              "fakeDestinationRule",
 			Namespace:         "default",
 			Domain:            "cluster.local",
@@ -193,7 +218,7 @@ func TestNonServiceConfig(t *testing.T) {
 			Host: "fakehost",
 		},
 	}
-	_, err := store.Create(config)
+	_, err := store.Create(cfg)
 	if err != nil {
 		t.Errorf("error occurred crearting ServiceEntry config: %v", err)
 	}
@@ -201,11 +226,12 @@ func TestNonServiceConfig(t *testing.T) {
 	// Now create some service entries and verify that it's added to the registry.
 	createServiceEntries([]*model.Config{httpDNS, tcpStatic}, store, t)
 	expectedInstances := []*model.ServiceInstance{
-		makeInstance(httpDNS, "us.google.com", 7080, httpDNS.Spec.(*networking.ServiceEntry).Ports[0], nil),
-		makeInstance(httpDNS, "uk.google.com", 1080, httpDNS.Spec.(*networking.ServiceEntry).Ports[0], nil),
-		makeInstance(httpDNS, "de.google.com", 80, httpDNS.Spec.(*networking.ServiceEntry).Ports[0], map[string]string{"foo": "bar"}),
+		makeInstance(httpDNS, "us.google.com", 7080, httpDNS.Spec.(*networking.ServiceEntry).Ports[0], nil, true),
+		makeInstance(httpDNS, "uk.google.com", 1080, httpDNS.Spec.(*networking.ServiceEntry).Ports[0], nil, true),
+		makeInstance(httpDNS, "de.google.com", 80, httpDNS.Spec.(*networking.ServiceEntry).Ports[0], map[string]string{"foo": "bar"}, true),
 	}
-	instances, err := sd.InstancesByPort("*.google.com", 80, nil)
+	svc := convertServices(*httpDNS)
+	instances, err := sd.InstancesByPort(svc[0], 80, nil)
 	if err != nil {
 		t.Errorf("Instances() encountered unexpected error: %v", err)
 	}
@@ -213,6 +239,172 @@ func TestNonServiceConfig(t *testing.T) {
 	sortServiceInstances(expectedInstances)
 	if err := compare(t, instances, expectedInstances); err != nil {
 		t.Error(err)
+	}
+}
+
+func TestServicesChanged(t *testing.T) {
+
+	var updatedHTTPDNS = &model.Config{
+		ConfigMeta: model.ConfigMeta{
+			Type:              schemas.ServiceEntry.Type,
+			Name:              "httpDNS",
+			Namespace:         "httpDNS",
+			CreationTimestamp: GlobalTime,
+			Labels:            map[string]string{model.TLSModeLabelName: model.IstioMutualTLSModeLabel},
+		},
+		Spec: &networking.ServiceEntry{
+			Hosts: []string{"*.google.com", "*.mail.com"},
+			Ports: []*networking.Port{
+				{Number: 80, Name: "http-port", Protocol: "http"},
+				{Number: 8080, Name: "http-alt-port", Protocol: "http"},
+			},
+			Endpoints: []*networking.ServiceEntry_Endpoint{
+				{
+					Address: "us.google.com",
+					Ports:   map[string]uint32{"http-port": 7080, "http-alt-port": 18080},
+					Labels:  map[string]string{model.TLSModeLabelName: model.IstioMutualTLSModeLabel},
+				},
+				{
+					Address: "uk.google.com",
+					Ports:   map[string]uint32{"http-port": 1080},
+					Labels:  map[string]string{model.TLSModeLabelName: model.IstioMutualTLSModeLabel},
+				},
+				{
+					Address: "de.google.com",
+					Labels:  map[string]string{"foo": "bar", model.TLSModeLabelName: model.IstioMutualTLSModeLabel},
+				},
+			},
+			Location:   networking.ServiceEntry_MESH_EXTERNAL,
+			Resolution: networking.ServiceEntry_DNS,
+		},
+	}
+
+	var updatedHTTPDNSPort = &model.Config{
+		ConfigMeta: model.ConfigMeta{
+			Type:              schemas.ServiceEntry.Type,
+			Name:              "httpDNS",
+			Namespace:         "httpDNS",
+			CreationTimestamp: GlobalTime,
+			Labels:            map[string]string{model.TLSModeLabelName: model.IstioMutualTLSModeLabel},
+		},
+		Spec: &networking.ServiceEntry{
+			Hosts: []string{"*.google.com", "*.mail.com"},
+			Ports: []*networking.Port{
+				{Number: 80, Name: "http-port", Protocol: "http"},
+				{Number: 8080, Name: "http-alt-port", Protocol: "http"},
+				{Number: 9090, Name: "http-new-port", Protocol: "http"},
+			},
+			Endpoints: []*networking.ServiceEntry_Endpoint{
+				{
+					Address: "us.google.com",
+					Ports:   map[string]uint32{"http-port": 7080, "http-alt-port": 18080},
+					Labels:  map[string]string{model.TLSModeLabelName: model.IstioMutualTLSModeLabel},
+				},
+				{
+					Address: "uk.google.com",
+					Ports:   map[string]uint32{"http-port": 1080},
+					Labels:  map[string]string{model.TLSModeLabelName: model.IstioMutualTLSModeLabel},
+				},
+				{
+					Address: "de.google.com",
+					Labels:  map[string]string{"foo": "bar", model.TLSModeLabelName: model.IstioMutualTLSModeLabel},
+				},
+			},
+			Location:   networking.ServiceEntry_MESH_EXTERNAL,
+			Resolution: networking.ServiceEntry_DNS,
+		},
+	}
+
+	var updatedEndpoint = &model.Config{
+		ConfigMeta: model.ConfigMeta{
+			Type:              schemas.ServiceEntry.Type,
+			Name:              "httpDNS",
+			Namespace:         "httpDNS",
+			CreationTimestamp: GlobalTime,
+			Labels:            map[string]string{model.TLSModeLabelName: model.IstioMutualTLSModeLabel},
+		},
+		Spec: &networking.ServiceEntry{
+			Hosts: []string{"*.google.com", "*.mail.com"},
+			Ports: []*networking.Port{
+				{Number: 80, Name: "http-port", Protocol: "http"},
+				{Number: 8080, Name: "http-alt-port", Protocol: "http"},
+			},
+			Endpoints: []*networking.ServiceEntry_Endpoint{
+				{
+					Address: "us.google.com",
+					Ports:   map[string]uint32{"http-port": 7080, "http-alt-port": 18080},
+					Labels:  map[string]string{model.TLSModeLabelName: model.IstioMutualTLSModeLabel},
+				},
+				{
+					Address: "uk.google.com",
+					Ports:   map[string]uint32{"http-port": 1080},
+					Labels:  map[string]string{model.TLSModeLabelName: model.IstioMutualTLSModeLabel},
+				},
+				{
+					Address: "de.google.com",
+					Labels:  map[string]string{"foo": "bar", model.TLSModeLabelName: model.IstioMutualTLSModeLabel},
+				},
+				{
+					Address: "in.google.com",
+					Labels:  map[string]string{"foo": "bar", model.TLSModeLabelName: model.IstioMutualTLSModeLabel},
+				},
+			},
+			Location:   networking.ServiceEntry_MESH_EXTERNAL,
+			Resolution: networking.ServiceEntry_DNS,
+		},
+	}
+	cases := []struct {
+		name string
+		a    *model.Config
+		b    *model.Config
+		want bool
+	}{
+		{
+			"same config",
+			httpDNS,
+			httpDNS,
+			false,
+		},
+		{
+			"different config",
+			httpDNS,
+			httpNoneInternal,
+			true,
+		},
+		{
+			"different resolution",
+			tcpDNS,
+			tcpStatic,
+			true,
+		},
+		{
+			"config modified with additional host",
+			httpDNS,
+			updatedHTTPDNS,
+			true,
+		},
+		{
+			"config modified with additional port",
+			updatedHTTPDNS,
+			updatedHTTPDNSPort,
+			true,
+		},
+		{
+			"same config with additional endpoint",
+			updatedHTTPDNS,
+			updatedEndpoint,
+			false,
+		},
+	}
+	for _, tt := range cases {
+		t.Run(tt.name, func(t *testing.T) {
+			as := convertServices(*tt.a)
+			bs := convertServices(*tt.b)
+			got := servicesChanged(as, bs)
+			if got != tt.want {
+				t.Errorf("ServicesChanged got %v, want %v", got, tt.want)
+			}
+		})
 	}
 }
 
@@ -224,7 +416,7 @@ func sortServices(services []*model.Service) {
 }
 
 func sortServiceInstances(instances []*model.ServiceInstance) {
-	labelsToSlice := func(labels model.Labels) []string {
+	labelsToSlice := func(labels labels.Instance) []string {
 		out := make([]string, 0, len(labels))
 		for k, v := range labels {
 			out = append(out, fmt.Sprintf("%s=%s", k, v))

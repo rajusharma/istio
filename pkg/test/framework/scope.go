@@ -17,6 +17,7 @@ package framework
 import (
 	"fmt"
 	"io"
+	"sync"
 
 	"github.com/hashicorp/go-multierror"
 
@@ -38,6 +39,9 @@ type scope struct {
 	children []*scope
 
 	closeChan chan struct{}
+
+	// Mutex to lock changes to resources, children, and closers that can be done concurrently
+	mu sync.Mutex
 }
 
 func newScope(id string, p *scope) *scope {
@@ -56,6 +60,8 @@ func newScope(id string, p *scope) *scope {
 
 func (s *scope) add(r resource.Resource, id *resourceID) {
 	scopes.Framework.Debugf("Adding resource for tracking: %v", id)
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	s.resources = append(s.resources, r)
 
 	if c, ok := r.(io.Closer); ok {
@@ -95,13 +101,15 @@ func (s *scope) done(nocleanup bool) error {
 			scopes.Framework.Debugf("Begin cleaning up %s", name)
 			if e := c.Close(); e != nil {
 				scopes.Framework.Debugf("Error cleaning up %s: %v", name, e)
-				err = multierror.Append(e, err)
+				err = multierror.Append(err, e)
 			}
 			scopes.Framework.Debugf("Cleanup complete for %s", name)
 		}
 	}
+	s.mu.Lock()
 	s.resources = nil
 	s.closers = nil
+	s.mu.Unlock()
 
 	scopes.Framework.Debugf("Done cleaning up scope: %v", s.id)
 	return err
@@ -112,10 +120,11 @@ func (s *scope) waitForDone() {
 }
 
 func (s *scope) dump() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	for _, c := range s.children {
 		c.dump()
 	}
-
 	for _, c := range s.resources {
 		if d, ok := c.(resource.Dumper); ok {
 			d.Dump()

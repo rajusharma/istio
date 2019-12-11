@@ -36,6 +36,8 @@ func init() {
 		"Specifies the namespace in which istio egressgateway is deployed.")
 	flag.BoolVar(&settingsFromCommandline.DeployIstio, "istio.test.kube.deploy", settingsFromCommandline.DeployIstio,
 		"Deploy Istio into the target Kubernetes environment.")
+	flag.BoolVar(&settingsFromCommandline.Operator, "istio.test.kube.operator", settingsFromCommandline.Operator,
+		"Deploy Istio into the target Kubernetes environment using the operator.")
 	flag.DurationVar(&settingsFromCommandline.DeployTimeout, "istio.test.kube.deployTimeout", 0,
 		"Timeout applied to deploying Istio into the target Kubernetes environment. Only applies if DeployIstio=true.")
 	flag.DurationVar(&settingsFromCommandline.UndeployTimeout, "istio.test.kube.undeployTimeout", 0,
@@ -46,4 +48,7 @@ func init() {
 		"Helm values file. This can be an absolute path or relative to chartDir. Only valid when deploying Istio.")
 	flag.StringVar(&helmValues, "istio.test.kube.helm.values", helmValues,
 		"Manual overrides for Helm values file. Only valid when deploying Istio.")
+	flag.StringVar(&settingsFromCommandline.CustomSidecarInjectorNamespace, "istio.test.kube.customSidecarInjectorNamespace",
+		settingsFromCommandline.CustomSidecarInjectorNamespace, "Inject the sidecar from the specified namespace")
+
 }

@@ -38,11 +38,17 @@ and check if TLS settings are compatible between them.
 # Check settings for pod "foo-656bd7df7c-5zp4s" in namespace default:
 istioctl authn tls-check foo-656bd7df7c-5zp4s.default
 
-# Check settings for pod "foo-656bd7df7c-5zp4s" in namespace default, filtered on destintation
+# Check settings for pod "foo-656bd7df7c-5zp4s" in namespace default, filtered on destination
 service "bar" :
 istioctl authn tls-check foo-656bd7df7c-5zp4s.default bar
 `,
-		Args: cobra.MinimumNArgs(1),
+		Args: func(cmd *cobra.Command, args []string) error {
+			if len(args) < 1 {
+				cmd.Println(cmd.UsageString())
+				return fmt.Errorf("tls-check requires pod name")
+			}
+			return nil
+		},
 		RunE: func(cmd *cobra.Command, args []string) error {
 			kubeClient, err := clientExecFactory(kubeconfig, configContext)
 			if err != nil {

@@ -22,7 +22,6 @@ import (
 	"io/ioutil"
 	"net/http"
 	"net/url"
-	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -30,6 +29,7 @@ import (
 
 	authn "istio.io/api/authentication/v1alpha1"
 	"istio.io/pkg/cache"
+	"istio.io/pkg/monitoring"
 )
 
 const (
@@ -70,14 +70,28 @@ const (
 	// means it's called when the periodically refresh job is triggered. We can retry more aggressively
 	// as it's running separately from the main flow.
 	networkFetchRetryCountOnRefreshFlow = 3
+
+	// jwksPublicRootCABundlePath is the path of public root CA bundle in pilot container.
+	jwksPublicRootCABundlePath = "/cacert.pem"
+	// jwksExtraRootCABundlePath is the path to any additional CA certificates pilot should accept when resolving JWKS URIs
+	jwksExtraRootCABundlePath = "/cacerts/extra.pem"
 )
 
 var (
-	// PublicRootCABundlePath is the path of public root CA bundle in pilot container.
-	publicRootCABundlePath = "/cacert.pem"
-
 	// Close channel
 	closeChan = make(chan bool)
+
+	networkFetchSuccessCounter = monitoring.NewSum(
+		"pilot_jwks_resolver_network_fetch_success_total",
+		"Total number of successfully network fetch by pilot jwks resolver",
+	)
+	networkFetchFailCounter = monitoring.NewSum(
+		"pilot_jwks_resolver_network_fetch_fail_total",
+		"Total number of failed network fetch by pilot jwks resolver",
+	)
+
+	// JwtKeyResolver resolves JWT public key and JwksURI.
+	JwtKeyResolver = NewJwksResolver(JwtPubKeyEvictionDuration, JwtPubKeyRefreshInterval)
 )
 
 // jwtPubKeyEntry is a single cached entry for jwt public key.
@@ -120,17 +134,26 @@ type JwksResolver struct {
 	refreshJobFetchFailedCount uint64
 }
 
+func init() {
+	monitoring.MustRegister(networkFetchSuccessCounter, networkFetchFailCounter)
+}
+
 // NewJwksResolver creates new instance of JwksResolver.
 func NewJwksResolver(evictionDuration, refreshInterval time.Duration) *JwksResolver {
+	return newJwksResolverWithCABundlePaths(
+		evictionDuration,
+		refreshInterval,
+		[]string{jwksPublicRootCABundlePath, jwksExtraRootCABundlePath},
+	)
+}
+
+func newJwksResolverWithCABundlePaths(evictionDuration, refreshInterval time.Duration, caBundlePaths []string) *JwksResolver {
 	ret := &JwksResolver{
 		JwksURICache:     cache.NewTTL(jwksURICacheExpiration, jwksURICacheEviction),
 		evictionDuration: evictionDuration,
 		refreshInterval:  refreshInterval,
 		httpClient: &http.Client{
 			Timeout: jwksHTTPTimeOutInSec * time.Second,
-
-			// TODO: pilot needs to include a collection of root CAs to make external
-			// https web request(https://github.com/istio/istio/issues/1419).
 			Transport: &http.Transport{
 				DisableKeepAlives: true,
 				TLSClientConfig:   &tls.Config{InsecureSkipVerify: true},
@@ -138,10 +161,15 @@ func NewJwksResolver(evictionDuration, refreshInterval time.Duration) *JwksResol
 		},
 	}
 
-	caCert, err := ioutil.ReadFile(publicRootCABundlePath)
-	if err == nil {
-		caCertPool := x509.NewCertPool()
-		caCertPool.AppendCertsFromPEM(caCert)
+	caCertPool := x509.NewCertPool()
+	caCertsFound := false
+	for _, pemFile := range caBundlePaths {
+		caCert, err := ioutil.ReadFile(pemFile)
+		if err == nil {
+			caCertsFound = caCertPool.AppendCertsFromPEM(caCert) || caCertsFound
+		}
+	}
+	if caCertsFound {
 		ret.secureHTTPClient = &http.Client{
 			Timeout: jwksHTTPTimeOutInSec * time.Second,
 			Transport: &http.Transport{
@@ -170,7 +198,7 @@ func (r *JwksResolver) SetAuthenticationPolicyJwksURIs(policy *authn.Policy) err
 		switch method.GetParams().(type) {
 		case *authn.PeerAuthenticationMethod_Jwt:
 			policyJwt := method.GetJwt()
-			if policyJwt.JwksUri == "" {
+			if policyJwt.JwksUri == "" && policyJwt.Jwks == "" {
 				uri, err := r.resolveJwksURIUsingOpenID(policyJwt.Issuer)
 				if err != nil {
 					log.Warnf("Failed to get jwks_uri for issuer %q: %v", policyJwt.Issuer, err)
@@ -183,7 +211,7 @@ func (r *JwksResolver) SetAuthenticationPolicyJwksURIs(policy *authn.Policy) err
 	for _, method := range policy.Origins {
 		// JWT is only allowed authentication method type for Origin.
 		policyJwt := method.GetJwt()
-		if policyJwt.JwksUri == "" {
+		if policyJwt.JwksUri == "" && policyJwt.Jwks == "" {
 			uri, err := r.resolveJwksURIUsingOpenID(policyJwt.Issuer)
 			if err != nil {
 				log.Warnf("Failed to get jwks_uri for issuer %q: %v", policyJwt.Issuer, err)
@@ -270,14 +298,19 @@ func (r *JwksResolver) getRemoteContentWithRetry(uri string, retry int) ([]byte,
 		client = r.secureHTTPClient
 	}
 
-	getPublicKey := func() ([]byte, error) {
+	getPublicKey := func() (b []byte, e error) {
 		resp, err := client.Get(uri)
+		defer func() {
+			if e != nil {
+				networkFetchFailCounter.Increment()
+				return
+			}
+			networkFetchSuccessCounter.Increment()
+			_ = resp.Body.Close()
+		}()
 		if err != nil {
 			return nil, err
 		}
-		defer func() {
-			_ = resp.Body.Close()
-		}()
 
 		body, err := ioutil.ReadAll(resp.Body)
 		if err != nil {
@@ -386,43 +419,4 @@ func (r *JwksResolver) refresh() {
 // (right now calls it from initDiscoveryService in pkg/bootstrap/server.go).
 func (r *JwksResolver) Close() {
 	closeChan <- true
-}
-
-// ParseJwksURI parses the input URI and returns the corresponding hostname, port, and whether SSL is used.
-// URI must start with "http://" or "https://", which corresponding to "http" or "https" scheme.
-// Port number is extracted from URI if available (i.e from postfix :<port>, eg. ":80"), or assigned
-// to a default value based on URI scheme (80 for http and 443 for https).
-// Port name is set to URI scheme value.
-// Note: this is to replace [buildJWKSURIClusterNameAndAddress]
-// (https://github.com/istio/istio/blob/master/pilot/pkg/proxy/envoy/v1/mixer.go#L401),
-// which is used for the old EUC policy.
-func ParseJwksURI(jwksURI string) (string, *Port, bool, error) {
-	u, err := url.Parse(jwksURI)
-	if err != nil {
-		return "", nil, false, err
-	}
-	var useSSL bool
-	var portNumber int
-	switch u.Scheme {
-	case "http":
-		useSSL = false
-		portNumber = 80
-	case "https":
-		useSSL = true
-		portNumber = 443
-	default:
-		return "", nil, false, fmt.Errorf("URI scheme %q is not supported", u.Scheme)
-	}
-
-	if u.Port() != "" {
-		portNumber, err = strconv.Atoi(u.Port())
-		if err != nil {
-			return "", nil, useSSL, err
-		}
-	}
-
-	return u.Hostname(), &Port{
-		Name: u.Scheme,
-		Port: portNumber,
-	}, useSSL, nil
 }

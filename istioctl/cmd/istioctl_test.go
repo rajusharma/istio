@@ -23,9 +23,12 @@ import (
 	"testing"
 
 	networking "istio.io/api/networking/v1alpha3"
+
 	"istio.io/istio/pilot/pkg/config/memory"
 	"istio.io/istio/pilot/pkg/model"
 	"istio.io/istio/pilot/test/util"
+	"istio.io/istio/pkg/config/schema"
+	"istio.io/istio/pkg/config/schemas"
 )
 
 // sortedConfigStore lets us facade any ConfigStore (such as memory.Make()'s) providing
@@ -52,9 +55,9 @@ var (
 			ConfigMeta: model.ConfigMeta{
 				Name:      "bookinfo-gateway",
 				Namespace: "default",
-				Type:      model.Gateway.Type,
-				Group:     model.Gateway.Group,
-				Version:   model.Gateway.Version,
+				Type:      schemas.Gateway.Type,
+				Group:     schemas.Gateway.Group,
+				Version:   schemas.Gateway.Version,
 			},
 			Spec: &networking.Gateway{
 				Selector: map[string]string{"istio": "ingressgateway"},
@@ -77,9 +80,9 @@ var (
 			ConfigMeta: model.ConfigMeta{
 				Name:      "bookinfo",
 				Namespace: "default",
-				Type:      model.VirtualService.Type,
-				Group:     model.VirtualService.Group,
-				Version:   model.VirtualService.Version,
+				Type:      schemas.VirtualService.Type,
+				Group:     schemas.VirtualService.Group,
+				Version:   schemas.VirtualService.Version,
 			},
 			Spec: &networking.VirtualService{
 				Hosts:    []string{"*"},
@@ -113,7 +116,7 @@ var (
 								Destination: &networking.Destination{
 									Host: "productpage",
 									Port: &networking.PortSelector{
-										Port: &networking.PortSelector_Number{Number: 80},
+										Number: 80,
 									},
 								},
 							},
@@ -129,9 +132,9 @@ var (
 			ConfigMeta: model.ConfigMeta{
 				Name:      "googleapis",
 				Namespace: "default",
-				Type:      model.DestinationRule.Type,
-				Group:     model.DestinationRule.Group,
-				Version:   model.DestinationRule.Version,
+				Type:      schemas.DestinationRule.Type,
+				Group:     schemas.DestinationRule.Group,
+				Version:   schemas.DestinationRule.Version,
 			},
 			Spec: &networking.DestinationRule{
 				Host: "*.googleapis.com",
@@ -149,9 +152,9 @@ var (
 			ConfigMeta: model.ConfigMeta{
 				Name:      "googleapis",
 				Namespace: "default",
-				Type:      model.ServiceEntry.Type,
-				Group:     model.ServiceEntry.Group,
-				Version:   model.ServiceEntry.Version,
+				Type:      schemas.ServiceEntry.Type,
+				Group:     schemas.ServiceEntry.Group,
+				Version:   schemas.ServiceEntry.Version,
 			},
 			Spec: &networking.ServiceEntry{
 				Hosts: []string{"*.googleapis.com"},
@@ -275,6 +278,41 @@ func TestDelete(t *testing.T) {
 	}
 }
 
+func TestBadParse(t *testing.T) {
+	// unknown flags should be a command parse
+	rootCmd := GetRootCmd([]string{"--unknown-flag"})
+	fErr := rootCmd.Execute()
+
+	switch fErr.(type) {
+	case CommandParseError:
+		// do nothing
+	default:
+		t.Errorf("Expected a CommandParseError, but got %q.", fErr)
+	}
+
+	// we should propagate to subcommands
+	rootCmd = GetRootCmd([]string{"x", "analyze", "--unknown-flag"})
+	fErr = rootCmd.Execute()
+
+	switch fErr.(type) {
+	case CommandParseError:
+		// do nothing
+	default:
+		t.Errorf("Expected a CommandParseError, but got %q.", fErr)
+	}
+
+	// all of the subcommands
+	rootCmd = GetRootCmd([]string{"authn", "tls-check", "--unknown-flag"})
+	fErr = rootCmd.Execute()
+
+	switch fErr.(type) {
+	case CommandParseError:
+		// do nothing
+	default:
+		t.Errorf("Expected a CommandParseError, but got %q.", fErr)
+	}
+}
+
 // mockClientFactoryGenerator creates a factory for model.ConfigStore preloaded with data
 func mockClientFactoryGenerator(configs []model.Config) func() (model.ConfigStore, error) {
 	outFactory := func() (model.ConfigStore, error) {
@@ -314,8 +352,15 @@ func (cs sortedConfigStore) Delete(typ, name, namespace string) error {
 	return cs.store.Delete(typ, name, namespace)
 }
 
-func (cs sortedConfigStore) ConfigDescriptor() model.ConfigDescriptor {
+func (cs sortedConfigStore) ConfigDescriptor() schema.Set {
 	return cs.store.ConfigDescriptor()
+}
+
+func (cs sortedConfigStore) Version() string {
+	return cs.store.Version()
+}
+func (cs sortedConfigStore) GetResourceAtVersion(version string, key string) (resourceVersion string, err error) {
+	return cs.store.GetResourceAtVersion(version, key)
 }
 
 // List() is a facade that always returns cs.store items sorted by name/namespace

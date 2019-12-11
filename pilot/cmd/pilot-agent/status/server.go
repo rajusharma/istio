@@ -63,13 +63,12 @@ type KubeAppProbers map[string]*corev1.HTTPGetAction
 
 // Config for the status server.
 type Config struct {
-	LocalHostAddr    string
-	StatusPort       uint16
-	AdminPort        uint16
-	ApplicationPorts []uint16
+	LocalHostAddr string
 	// KubeAppHTTPProbers is a json with Kubernetes application HTTP prober config encoded.
 	KubeAppHTTPProbers string
 	NodeType           model.NodeType
+	StatusPort         uint16
+	AdminPort          uint16
 }
 
 // Server provides an endpoint for handling status probes.
@@ -86,10 +85,9 @@ func NewServer(config Config) (*Server, error) {
 	s := &Server{
 		statusPort: config.StatusPort,
 		ready: &ready.Probe{
-			LocalHostAddr:    config.LocalHostAddr,
-			AdminPort:        config.AdminPort,
-			ApplicationPorts: config.ApplicationPorts,
-			NodeType:         config.NodeType,
+			LocalHostAddr: config.LocalHostAddr,
+			AdminPort:     config.AdminPort,
+			NodeType:      config.NodeType,
 		},
 	}
 	if config.KubeAppHTTPProbers == "" {
@@ -177,14 +175,28 @@ func (s *Server) handleReadyProbe(w http.ResponseWriter, _ *http.Request) {
 	s.mutex.Unlock()
 }
 
+func isRequestFromLocalhost(r *http.Request) bool {
+	ip, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		return false
+	}
+
+	userIP := net.ParseIP(ip)
+	return userIP.IsLoopback()
+}
+
 func (s *Server) handleQuit(w http.ResponseWriter, r *http.Request) {
+	if !isRequestFromLocalhost(r) {
+		http.Error(w, "Only requests from localhost are allowed", http.StatusForbidden)
+		return
+	}
 	if r.Method != "POST" {
 		http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
 		return
 	}
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write([]byte("OK"))
-	log.Infof("handling %s, and notify pilot-agent to exit", quitPath)
+	log.Infof("handling %s, notifying pilot-agent to exit", quitPath)
 	notifyExit()
 }
 
@@ -251,5 +263,7 @@ func notifyExit() {
 	if err != nil {
 		log.Errora(err)
 	}
-	log.Errora(p.Signal(syscall.SIGTERM))
+	if err := p.Signal(syscall.SIGTERM); err != nil {
+		log.Errorf("failed to send SIGTERM to self: %v", err)
+	}
 }

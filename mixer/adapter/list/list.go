@@ -13,7 +13,7 @@
 // limitations under the License.
 
 // nolint: lll
-//go:generate $GOPATH/src/istio.io/istio/bin/mixer_codegen.sh -a mixer/adapter/list/config/config.proto -x "-n listchecker -t listentry"
+//go:generate $REPO_ROOT/bin/mixer_codegen.sh -a mixer/adapter/list/config/config.proto -x "-n listchecker -t listentry"
 
 // Package list provides an adapter that implements the listEntry
 // template to enable blacklist / whitelist checking of values.
@@ -33,7 +33,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/gogo/googleapis/google/rpc"
+	rpc "istio.io/gogo-genproto/googleapis/google/rpc"
 
 	"istio.io/api/policy/v1beta1"
 	"istio.io/istio/mixer/adapter/list/config"

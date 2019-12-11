@@ -12,6 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// nolint: lll
+//go:generate go run $REPO_ROOT/pilot/tools/generate_config_crd_types.go --template $REPO_ROOT/pilot/tools/types.go.tmpl --output $REPO_ROOT/pilot/pkg/config/kube/crd/types.gen.go
+
 package crd
 
 import (
@@ -19,6 +22,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 
 	"istio.io/istio/pilot/pkg/model"
+	"istio.io/istio/pkg/config/schema"
 )
 
 // IstioKind is the generic Kubernetes API object wrapper
@@ -139,7 +143,7 @@ type IstioObjectList interface {
 	GetItems() []IstioObject
 }
 
-func APIVersion(schema *model.ProtoSchema) string {
+func APIVersion(schema *schema.Instance) string {
 	return ResourceGroup(schema) + "/" + schema.Version
 }
 

@@ -17,7 +17,6 @@ package metrics
 import (
 	"fmt"
 	"testing"
-	"time"
 
 	"istio.io/istio/pkg/test/framework"
 	"istio.io/istio/pkg/test/framework/components/bookinfo"
@@ -48,7 +47,7 @@ var (
 func TestIngessToPrometheus_ServiceMetric(t *testing.T) {
 	framework.
 		NewTest(t).
-		// TODO(https://github.com/istio/istio/issues/12750)
+		// TODO(https://github.com/istio/istio/issues/14819)
 		Label(label.Flaky).
 		RequiresEnvironment(environment.Kube).
 		Run(func(ctx framework.TestContext) {
@@ -62,13 +61,20 @@ func TestIngessToPrometheus_ServiceMetric(t *testing.T) {
 func TestIngessToPrometheus_IngressMetric(t *testing.T) {
 	framework.
 		NewTest(t).
-		// TODO(https://github.com/istio/istio/issues/12750)
-		Label(label.Flaky).
 		RequiresEnvironment(environment.Kube).
 		Run(func(ctx framework.TestContext) {
-			label := "destination_service"
-			labelValue := "productpage.{{.TestNamespace}}.svc.cluster.local"
-			testMetric(t, ctx, label, labelValue)
+			ctx.NewSubTest("SetupAndPrometheus").
+				Run(func(ctx framework.TestContext) {
+					label := "destination_service"
+					labelValue := "productpage.{{.TestNamespace}}.svc.cluster.local"
+					testMetric(t, ctx, label, labelValue)
+				})
+
+			ctx.NewSubTest("IstioctlPrometheusConnection").
+				Run(func(ctx framework.TestContext) {
+					workload := "productpage-v1"
+					testIstioctl(t, ctx, workload)
+				})
 		})
 }
 
@@ -88,9 +94,11 @@ func testMetric(t *testing.T, ctx framework.TestContext, label string, labelValu
 	util.AllowRuleSync(t)
 
 	// Warm up
-	err := util.VisitProductPage(ing, 30*time.Second, 200, t)
-	if err != nil {
-		t.Fatalf("unable to retrieve 200 from product page: %v", err)
+	addr := ing.HTTPAddress()
+	url := fmt.Sprintf("http://%s/productpage", addr.String())
+	res := util.SendTraffic(ing, t, "Sending traffic", url, "", 10)
+	if res.RetCodes[200] < 1 {
+		t.Fatalf("unable to retrieve 200 from product page: %v", res.RetCodes)
 	}
 
 	label = tmpl.EvaluateOrFail(t, label, map[string]string{"TestNamespace": bookinfoNs.Name()})
@@ -103,9 +111,9 @@ func testMetric(t *testing.T, ctx framework.TestContext, label string, labelValu
 	}
 	t.Logf("Baseline established: initial = %v", initial)
 
-	err = util.VisitProductPage(ing, 30*time.Second, 200, t)
-	if err != nil {
-		t.Fatalf("unable to retrieve 200 from product page: %v", err)
+	res = util.SendTraffic(ing, t, "Sending traffic", url, "", 10)
+	if res.RetCodes[200] < 1 {
+		t.Fatalf("unable to retrieve 200 from product page: %v", res.RetCodes)
 	}
 
 	final, err := prom.WaitForQuiesce(`istio_requests_total{%s=%q,response_code="200"}`, label, labelValue)
@@ -127,8 +135,9 @@ func testMetric(t *testing.T, ctx framework.TestContext, label string, labelValu
 		t.Fatal(err)
 	}
 
-	if (f - i) < float64(1) {
-		t.Errorf("Bad metric value: got %f, want at least 1", f-i)
+	// We should see 10 requests but giving an error of 1, to make test less flaky.
+	if (f - i) < float64(9) {
+		t.Errorf("Bad metric value: got %f, want at least 9", f-i)
 	}
 }
 
@@ -166,7 +175,7 @@ func TestStateMetrics(t *testing.T) {
 func TestTcpMetric(t *testing.T) {
 	framework.
 		NewTest(t).
-		// TODO(https://github.com/istio/istio/issues/12750)
+		// TODO(https://github.com/istio/istio/issues/18105)
 		Label(label.Flaky).
 		RequiresEnvironment(environment.Kube).
 		Run(func(ctx framework.TestContext) {
@@ -188,9 +197,11 @@ func TestTcpMetric(t *testing.T) {
 
 			util.AllowRuleSync(t)
 
-			err := util.VisitProductPage(ing, 30*time.Second, 200, t)
-			if err != nil {
-				t.Fatalf("unable to retrieve 200 from product page: %v", err)
+			addr := ing.HTTPAddress()
+			url := fmt.Sprintf("http://%s/productpage", addr.String())
+			res := util.SendTraffic(ing, t, "Sending traffic", url, "", 10)
+			if res.RetCodes[200] < 1 {
+				t.Fatalf("unable to retrieve 200 from product page: %v", res.RetCodes)
 			}
 
 			query := fmt.Sprintf("sum(istio_tcp_sent_bytes_total{destination_app=\"%s\"})", "mongodb")
@@ -217,7 +228,10 @@ func TestMain(m *testing.M) {
 }
 
 func testsetup(ctx resource.Context) (err error) {
-	bookinfoNs, err = namespace.New(ctx, "istio-bookinfo", true)
+	bookinfoNs, err = namespace.New(ctx, namespace.Config{
+		Prefix: "istio-bookinfo",
+		Inject: true,
+	})
 	if err != nil {
 		return
 	}

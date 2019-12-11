@@ -18,16 +18,18 @@ import (
 	"crypto/sha1"
 	"fmt"
 
-	"github.com/envoyproxy/go-control-plane/envoy/api/v2/auth"
-	"github.com/envoyproxy/go-control-plane/envoy/api/v2/core"
+	auth "github.com/envoyproxy/go-control-plane/envoy/api/v2/auth"
+	core "github.com/envoyproxy/go-control-plane/envoy/api/v2/core"
 	ldsv2 "github.com/envoyproxy/go-control-plane/envoy/api/v2/listener"
+	route "github.com/envoyproxy/go-control-plane/envoy/api/v2/route"
+	envoy_jwt "github.com/envoyproxy/go-control-plane/envoy/config/filter/http/jwt_authn/v2alpha"
 	http_conn "github.com/envoyproxy/go-control-plane/envoy/config/filter/network/http_connection_manager/v2"
-	"github.com/gogo/protobuf/proto"
-	"github.com/gogo/protobuf/types"
+	xdsutil "github.com/envoyproxy/go-control-plane/pkg/wellknown"
+	"github.com/golang/protobuf/proto"
+	"github.com/golang/protobuf/ptypes/empty"
+	structpb "github.com/golang/protobuf/ptypes/struct"
 
 	authn_v1alpha1 "istio.io/api/authentication/v1alpha1"
-	authn_filter "istio.io/api/envoy/config/filter/http/authn/v2alpha1"
-	jwtfilter "istio.io/api/envoy/config/filter/http/jwt_auth/v2alpha1"
 	"istio.io/pkg/log"
 
 	"istio.io/istio/pilot/pkg/features"
@@ -36,22 +38,19 @@ import (
 	"istio.io/istio/pilot/pkg/networking/util"
 	"istio.io/istio/pilot/pkg/security/authn"
 	authn_model "istio.io/istio/pilot/pkg/security/model"
+	"istio.io/istio/pkg/config/constants"
 	protovalue "istio.io/istio/pkg/proto"
+	authn_filter_policy "istio.io/istio/security/proto/authentication/v1alpha1"
+	authn_filter "istio.io/istio/security/proto/envoy/config/filter/http/authn/v2alpha1"
+	istio_jwt "istio.io/istio/security/proto/envoy/config/filter/http/jwt_auth/v2alpha1"
 )
 
 const (
-	// JwtFilterName is the name for the Jwt filter. This should be the same
-	// as the name defined in
-	// https://github.com/istio/proxy/blob/master/src/envoy/http/jwt_auth/http_filter_factory.cc#L50
-	JwtFilterName = "jwt-auth"
+	// The default header name for an exchanged token.
+	exchangedTokenHeaderName = "ingress-authorization"
 
-	// AuthnFilterName is the name for the Istio AuthN filter. This should be the same
-	// as the name defined in
-	// https://github.com/istio/proxy/blob/master/src/envoy/http/authn/http_filter_factory.cc#L30
-	AuthnFilterName = "istio_authn"
-
-	// EnvoyTLSInspectorFilterName is the name for Envoy TLS sniffing listener filter.
-	EnvoyTLSInspectorFilterName = "envoy.listener.tls_inspector"
+	// The default header prefix for an exchanged token.
+	exchangedTokenHeaderPrefix = "istio"
 )
 
 // GetMutualTLS returns pointer to mTLS params if the policy use mTLS for (peer) authentication.
@@ -80,7 +79,7 @@ func GetMutualTLS(policy *authn_v1alpha1.Policy) *authn_v1alpha1.MutualTls {
 // collectJwtSpecs returns a list of all JWT specs (pointers) defined the policy. This
 // provides a convenient way to iterate all Jwt specs.
 func collectJwtSpecs(policy *authn_v1alpha1.Policy) []*authn_v1alpha1.Jwt {
-	ret := []*authn_v1alpha1.Jwt{}
+	ret := make([]*authn_v1alpha1.Jwt, 0)
 	if policy == nil {
 		return ret
 	}
@@ -104,17 +103,73 @@ func outputLocationForJwtIssuer(issuer string) string {
 	return locationPrefix + fmt.Sprintf("%x", sum)
 }
 
-// ConvertPolicyToJwtConfig converts policy into Jwt filter config for envoy.
-func convertPolicyToJwtConfig(policy *authn_v1alpha1.Policy) *jwtfilter.JwtAuthentication {
-	policyJwts := collectJwtSpecs(policy)
-	if len(policyJwts) == 0 {
-		return nil
+func convertToEnvoyJwtConfig(policyJwts []*authn_v1alpha1.Jwt) *envoy_jwt.JwtAuthentication {
+	providers := map[string]*envoy_jwt.JwtProvider{}
+	for i, policyJwt := range policyJwts {
+		provider := &envoy_jwt.JwtProvider{
+			Issuer:            policyJwt.Issuer,
+			Audiences:         policyJwt.Audiences,
+			Forward:           true,
+			PayloadInMetadata: policyJwt.Issuer,
+		}
+
+		for _, location := range policyJwt.JwtHeaders {
+			header := &envoy_jwt.JwtHeader{
+				Name: location,
+			}
+			if location == exchangedTokenHeaderName {
+				header.ValuePrefix = exchangedTokenHeaderPrefix
+			}
+			provider.FromHeaders = append(provider.FromHeaders, header)
+		}
+		provider.FromParams = policyJwt.JwtParams
+
+		jwtPubKey := policyJwt.Jwks
+		if jwtPubKey == "" {
+			var err error
+			jwtPubKey, err = model.JwtKeyResolver.GetPublicKey(policyJwt.JwksUri)
+			if err != nil {
+				log.Errorf("Failed to fetch jwt public key from %q: %s", policyJwt.JwksUri, err)
+			}
+		}
+		provider.JwksSourceSpecifier = &envoy_jwt.JwtProvider_LocalJwks{
+			LocalJwks: &core.DataSource{
+				Specifier: &core.DataSource_InlineString{
+					InlineString: jwtPubKey,
+				},
+			},
+		}
+
+		name := fmt.Sprintf("origins-%d", i)
+		providers[name] = provider
 	}
-	ret := &jwtfilter.JwtAuthentication{
+
+	return &envoy_jwt.JwtAuthentication{
+		Rules: []*envoy_jwt.RequirementRule{
+			{
+				Match: &route.RouteMatch{
+					PathSpecifier: &route.RouteMatch_Prefix{
+						Prefix: "/",
+					},
+				},
+				Requires: &envoy_jwt.JwtRequirement{
+					RequiresType: &envoy_jwt.JwtRequirement_AllowMissingOrFailed{
+						AllowMissingOrFailed: &empty.Empty{},
+					},
+				},
+			},
+		},
+		Providers: providers,
+	}
+}
+
+// TODO: Remove after fully migrate to Envoy JWT filter.
+func convertToIstioJwtConfig(policyJwts []*authn_v1alpha1.Jwt) *istio_jwt.JwtAuthentication {
+	ret := &istio_jwt.JwtAuthentication{
 		AllowMissingOrFailed: true,
 	}
 	for _, policyJwt := range policyJwts {
-		jwt := &jwtfilter.JwtRule{
+		jwt := &istio_jwt.JwtRule{
 			Issuer:               policyJwt.Issuer,
 			Audiences:            policyJwt.Audiences,
 			ForwardPayloadHeader: outputLocationForJwtIssuer(policyJwt.Issuer),
@@ -122,21 +177,25 @@ func convertPolicyToJwtConfig(policy *authn_v1alpha1.Policy) *jwtfilter.JwtAuthe
 		}
 
 		for _, location := range policyJwt.JwtHeaders {
-			jwt.FromHeaders = append(jwt.FromHeaders, &jwtfilter.JwtHeader{
+			jwt.FromHeaders = append(jwt.FromHeaders, &istio_jwt.JwtHeader{
 				Name: location,
 			})
 		}
 		jwt.FromParams = policyJwt.JwtParams
 
-		jwtPubKey, err := authn_model.JwtKeyResolver.GetPublicKey(policyJwt.JwksUri)
-		if err != nil {
-			log.Warnf("Failed to fetch jwt public key from %q", policyJwt.JwksUri)
+		jwtPubKey := policyJwt.Jwks
+		if jwtPubKey == "" {
+			var err error
+			jwtPubKey, err = model.JwtKeyResolver.GetPublicKey(policyJwt.JwksUri)
+			if err != nil {
+				log.Errorf("Failed to fetch jwt public key from %q: %s", policyJwt.JwksUri, err)
+			}
 		}
 
 		// Put empty string in config even if above ResolveJwtPubKey fails.
-		jwt.JwksSourceSpecifier = &jwtfilter.JwtRule_LocalJwks{
-			LocalJwks: &jwtfilter.DataSource{
-				Specifier: &jwtfilter.DataSource_InlineString{
+		jwt.JwksSourceSpecifier = &istio_jwt.JwtRule_LocalJwks{
+			LocalJwks: &istio_jwt.DataSource{
+				Specifier: &istio_jwt.DataSource_InlineString{
 					InlineString: jwtPubKey,
 				},
 			},
@@ -147,27 +206,50 @@ func convertPolicyToJwtConfig(policy *authn_v1alpha1.Policy) *jwtfilter.JwtAuthe
 	return ret
 }
 
+// ConvertPolicyToJwtConfig converts policy into Jwt filter config for envoy.
+// Returns nil if there is no JWT policy. Returns the Istio JWT filter config if USE_ENVOY_JWT_FILTER
+// is false, otherwise returns the Envoy JWT filter config.
+func convertPolicyToJwtConfig(policy *authn_v1alpha1.Policy) (string, proto.Message) {
+	policyJwts := collectJwtSpecs(policy)
+	if len(policyJwts) == 0 {
+		return "", nil
+	}
+
+	if features.UseIstioJWTFilter.Get() {
+		return authn_model.IstioJwtFilterName, convertToIstioJwtConfig(policyJwts)
+	}
+
+	log.Debugf("Envoy JWT filter is used for JWT verification")
+	return authn_model.EnvoyJwtFilterName, convertToEnvoyJwtConfig(policyJwts)
+}
+
 // convertPolicyToAuthNFilterConfig returns an authn filter config corresponding for the input policy.
 func convertPolicyToAuthNFilterConfig(policy *authn_v1alpha1.Policy, proxyType model.NodeType) *authn_filter.FilterConfig {
 	if policy == nil || (len(policy.Peers) == 0 && len(policy.Origins) == 0) {
 		return nil
 	}
 
-	p := proto.Clone(policy).(*authn_v1alpha1.Policy)
+	// cloning proto from gogo to golang world
+	bytes, _ := policy.Marshal()
+	p := &authn_filter_policy.Policy{}
+	if err := proto.Unmarshal(bytes, p); err != nil {
+		return nil
+	}
+
 	// Create default mTLS params for params type mTLS but value is nil.
 	// This walks around the issue https://github.com/istio/istio/issues/4763
-	var usedPeers []*authn_v1alpha1.PeerAuthenticationMethod
+	var usedPeers []*authn_filter_policy.PeerAuthenticationMethod
 	for _, peer := range p.Peers {
 		switch peer.GetParams().(type) {
-		case *authn_v1alpha1.PeerAuthenticationMethod_Mtls:
+		case *authn_filter_policy.PeerAuthenticationMethod_Mtls:
 			// Only enable mTLS for sidecar, not Ingress/Router for now.
 			if proxyType == model.SidecarProxy {
 				if peer.GetMtls() == nil {
-					peer.Params = &authn_v1alpha1.PeerAuthenticationMethod_Mtls{Mtls: &authn_v1alpha1.MutualTls{}}
+					peer.Params = &authn_filter_policy.PeerAuthenticationMethod_Mtls{Mtls: &authn_filter_policy.MutualTls{}}
 				}
 				usedPeers = append(usedPeers, peer)
 			}
-		case *authn_v1alpha1.PeerAuthenticationMethod_Jwt:
+		case *authn_filter_policy.PeerAuthenticationMethod_Jwt:
 			usedPeers = append(usedPeers, peer)
 		}
 	}
@@ -175,6 +257,8 @@ func convertPolicyToAuthNFilterConfig(policy *authn_v1alpha1.Policy, proxyType m
 	p.Peers = usedPeers
 	filterConfig := &authn_filter.FilterConfig{
 		Policy: p,
+		// we can always set this field, it's no-op if mTLS is not used.
+		SkipValidateTrustDomain: features.SkipValidateTrustDomain.Get(),
 	}
 
 	// Remove targets part.
@@ -201,12 +285,12 @@ type v1alpha1PolicyApplier struct {
 
 func (a v1alpha1PolicyApplier) JwtFilter(isXDSMarshalingToAnyEnabled bool) *http_conn.HttpFilter {
 	// v2 api will use inline public key.
-	filterConfigProto := convertPolicyToJwtConfig(a.policy)
+	filterName, filterConfigProto := convertPolicyToJwtConfig(a.policy)
 	if filterConfigProto == nil {
 		return nil
 	}
 	out := &http_conn.HttpFilter{
-		Name: JwtFilterName,
+		Name: filterName,
 	}
 	if isXDSMarshalingToAnyEnabled {
 		out.ConfigType = &http_conn.HttpFilter_TypedConfig{TypedConfig: util.MessageToAny(filterConfigProto)}
@@ -222,7 +306,7 @@ func (a v1alpha1PolicyApplier) AuthNFilter(proxyType model.NodeType, isXDSMarsha
 		return nil
 	}
 	out := &http_conn.HttpFilter{
-		Name: AuthnFilterName,
+		Name: authn_model.AuthnFilterName,
 	}
 	if isXDSMarshalingToAnyEnabled {
 		out.ConfigType = &http_conn.HttpFilter_TypedConfig{TypedConfig: util.MessageToAny(filterConfigProto)}
@@ -232,7 +316,7 @@ func (a v1alpha1PolicyApplier) AuthNFilter(proxyType model.NodeType, isXDSMarsha
 	return out
 }
 
-func (a v1alpha1PolicyApplier) InboundFilterChain(sdsUdsPath string, sdsUseTrustworthyJwt, sdsUseNormalJwt bool, meta map[string]string) []plugin.FilterChain {
+func (a v1alpha1PolicyApplier) InboundFilterChain(sdsUdsPath string, meta *model.NodeMetadata) []plugin.FilterChain {
 	if a.policy == nil || len(a.policy.Peers) == 0 {
 		return nil
 	}
@@ -255,13 +339,13 @@ func (a v1alpha1PolicyApplier) InboundFilterChain(sdsUdsPath string, sdsUseTrust
 		RequireClientCertificate: protovalue.BoolTrue,
 	}
 	if sdsUdsPath == "" {
-		base := meta[features.BaseDir] + model.AuthCertsPath
-		tlsServerRootCert := model.GetOrDefaultFromMap(meta, model.NodeMetadataTLSServerRootCert, base+model.RootCertFilename)
+		base := meta.SdsBase + constants.AuthCertsPath
+		tlsServerRootCert := model.GetOrDefault(meta.TLSServerRootCert, base+constants.RootCertFilename)
 
 		tls.CommonTlsContext.ValidationContextType = authn_model.ConstructValidationContext(tlsServerRootCert, []string{} /*subjectAltNames*/)
 
-		tlsServerCertChain := model.GetOrDefaultFromMap(meta, model.NodeMetadataTLSServerCertChain, base+model.CertChainFilename)
-		tlsServerKey := model.GetOrDefaultFromMap(meta, model.NodeMetadataTLSServerKey, base+model.KeyFilename)
+		tlsServerCertChain := model.GetOrDefault(meta.TLSServerCertChain, base+constants.CertChainFilename)
+		tlsServerKey := model.GetOrDefault(meta.TLSServerKey, base+constants.KeyFilename)
 
 		tls.CommonTlsContext.TlsCertificates = []*auth.TlsCertificate{
 			{
@@ -279,14 +363,14 @@ func (a v1alpha1PolicyApplier) InboundFilterChain(sdsUdsPath string, sdsUseTrust
 		}
 	} else {
 		tls.CommonTlsContext.TlsCertificateSdsSecretConfigs = []*auth.SdsSecretConfig{
-			authn_model.ConstructSdsSecretConfig(authn_model.SDSDefaultResourceName, sdsUdsPath, sdsUseTrustworthyJwt, sdsUseNormalJwt, meta),
+			authn_model.ConstructSdsSecretConfig(authn_model.SDSDefaultResourceName, sdsUdsPath, meta),
 		}
 
 		tls.CommonTlsContext.ValidationContextType = &auth.CommonTlsContext_CombinedValidationContext{
 			CombinedValidationContext: &auth.CommonTlsContext_CombinedCertificateValidationContext{
 				DefaultValidationContext: &auth.CertificateValidationContext{VerifySubjectAltName: []string{} /*subjectAltNames*/},
 				ValidationContextSdsSecretConfig: authn_model.ConstructSdsSecretConfig(authn_model.SDSRootResourceName,
-					sdsUdsPath, sdsUseTrustworthyJwt, sdsUseNormalJwt, meta),
+					sdsUdsPath, meta),
 			},
 		}
 	}
@@ -307,10 +391,10 @@ func (a v1alpha1PolicyApplier) InboundFilterChain(sdsUdsPath string, sdsUseTrust
 			{
 				FilterChainMatch: alpnIstioMatch,
 				TLSContext:       tls,
-				ListenerFilters: []ldsv2.ListenerFilter{
+				ListenerFilters: []*ldsv2.ListenerFilter{
 					{
-						Name:       EnvoyTLSInspectorFilterName,
-						ConfigType: &ldsv2.ListenerFilter_Config{Config: &types.Struct{}},
+						Name:       xdsutil.TlsInspector,
+						ConfigType: &ldsv2.ListenerFilter_Config{Config: &structpb.Struct{}},
 					},
 				},
 			},

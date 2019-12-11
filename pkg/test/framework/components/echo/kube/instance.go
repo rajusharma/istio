@@ -24,6 +24,7 @@ import (
 	"github.com/hashicorp/go-multierror"
 
 	"istio.io/istio/pilot/pkg/model"
+	"istio.io/istio/pkg/config/protocol"
 	"istio.io/istio/pkg/test"
 	appEcho "istio.io/istio/pkg/test/echo/client"
 	"istio.io/istio/pkg/test/framework/components/echo"
@@ -37,7 +38,7 @@ import (
 const (
 	tcpHealthPort         = 3333
 	httpReadinessPort     = 8080
-	defaultDomain         = "svc.cluster.local"
+	defaultDomain         = "cluster.local"
 	noSidecarWaitDuration = 10 * time.Second
 )
 
@@ -53,11 +54,12 @@ type instance struct {
 	env       *kubeEnv.Environment
 	workloads []*workload
 	grpcPort  uint16
+	ctx       resource.Context
 }
 
 func newInstance(ctx resource.Context, cfg echo.Config) (out *instance, err error) {
 	// Fill in defaults for any missing values.
-	common.AddPortIfMissing(&cfg, model.ProtocolGRPC)
+	common.AddPortIfMissing(&cfg, protocol.GRPC)
 	if err = common.FillInDefaults(ctx, defaultDomain, &cfg); err != nil {
 		return nil, err
 	}
@@ -73,11 +75,12 @@ func newInstance(ctx resource.Context, cfg echo.Config) (out *instance, err erro
 	c := &instance{
 		env: env,
 		cfg: cfg,
+		ctx: ctx,
 	}
 	c.id = ctx.TrackResource(c)
 
 	// Save the GRPC port.
-	grpcPort := common.GetPortForProtocol(&cfg, model.ProtocolGRPC)
+	grpcPort := common.GetPortForProtocol(&cfg, protocol.GRPC)
 	if grpcPort == nil {
 		return nil, errors.New("unable fo find GRPC command port")
 	}
@@ -131,9 +134,9 @@ func getContainerPorts(ports []echo.Port) model.PortList {
 		containerPorts = append(containerPorts, cport)
 
 		switch p.Protocol {
-		case model.ProtocolGRPC:
+		case protocol.GRPC:
 			continue
-		case model.ProtocolHTTP:
+		case protocol.HTTP:
 			if p.InstancePort == httpReadinessPort {
 				readyPort = cport
 			}
@@ -148,14 +151,14 @@ func getContainerPorts(ports []echo.Port) model.PortList {
 	if readyPort == nil {
 		containerPorts = append(containerPorts, &model.Port{
 			Name:     "http-readiness-port",
-			Protocol: model.ProtocolHTTP,
+			Protocol: protocol.HTTP,
 			Port:     httpReadinessPort,
 		})
 	}
 	if healthPort == nil {
 		containerPorts = append(containerPorts, &model.Port{
 			Name:     "tcp-health-port",
-			Protocol: model.ProtocolHTTP,
+			Protocol: protocol.HTTP,
 			Port:     tcpHealthPort,
 		})
 	}
@@ -220,7 +223,7 @@ func (c *instance) initialize(endpoints *kubeCore.Endpoints) error {
 	workloads := make([]*workload, 0)
 	for _, subset := range endpoints.Subsets {
 		for _, addr := range subset.Addresses {
-			workload, err := newWorkload(addr, c.cfg.Annotations, c.grpcPort, c.env.Accessor)
+			workload, err := newWorkload(addr, c.cfg.Annotations, c.grpcPort, c.env.Accessor, c.ctx)
 			if err != nil {
 				return err
 			}

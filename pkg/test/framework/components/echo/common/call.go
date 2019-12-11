@@ -23,7 +23,7 @@ import (
 	"reflect"
 	"strconv"
 
-	"istio.io/istio/pilot/pkg/model"
+	"istio.io/istio/pkg/config/protocol"
 	"istio.io/istio/pkg/test/echo/client"
 	"istio.io/istio/pkg/test/echo/common"
 	"istio.io/istio/pkg/test/echo/common/scheme"
@@ -53,13 +53,12 @@ func CallEcho(c *client.Instance, opts *echo.CallOptions, outboundPortSelector O
 	}
 
 	// Forward a request from 'this' service to the destination service.
-	targetURL := fmt.Sprintf("%s://%s%s", string(opts.Scheme), net.JoinHostPort(opts.Host, strconv.Itoa(port)), opts.Path)
-	targetService := opts.Target.Config().Service
-
+	targetHost := net.JoinHostPort(opts.Host, strconv.Itoa(port))
+	targetURL := fmt.Sprintf("%s://%s%s", string(opts.Scheme), targetHost, opts.Path)
 	protoHeaders := []*proto.Header{
 		{
 			Key:   "Host",
-			Value: targetService,
+			Value: targetHost,
 		},
 	}
 	// Add headers in opts.Headers, e.g., authorization header, etc.
@@ -73,6 +72,7 @@ func CallEcho(c *client.Instance, opts *echo.CallOptions, outboundPortSelector O
 		Count:         int32(opts.Count),
 		Headers:       protoHeaders,
 		TimeoutMicros: common.DurationToMicros(opts.Timeout),
+		Message:       opts.Message,
 	}
 
 	resp, err := c.ForwardEcho(context.Background(), req)
@@ -155,11 +155,11 @@ func fillInCallOptions(opts *echo.CallOptions) error {
 
 func schemeForPort(port *echo.Port) (scheme.Instance, error) {
 	switch port.Protocol {
-	case model.ProtocolGRPC, model.ProtocolGRPCWeb, model.ProtocolHTTP2:
+	case protocol.GRPC, protocol.GRPCWeb, protocol.HTTP2:
 		return scheme.GRPC, nil
-	case model.ProtocolHTTP, model.ProtocolTCP:
+	case protocol.HTTP, protocol.TCP:
 		return scheme.HTTP, nil
-	case model.ProtocolHTTPS, model.ProtocolTLS:
+	case protocol.HTTPS, protocol.TLS:
 		return scheme.HTTPS, nil
 	default:
 		return "", fmt.Errorf("failed creating call for port %s: unsupported protocol %s",

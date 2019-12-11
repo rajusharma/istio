@@ -34,6 +34,7 @@ import (
 	ca "istio.io/istio/security/pkg/nodeagent/caclient"
 	caClientInterface "istio.io/istio/security/pkg/nodeagent/caclient/interface"
 	"istio.io/istio/security/pkg/nodeagent/model"
+	nodeagentutil "istio.io/istio/security/pkg/nodeagent/util"
 	"istio.io/pkg/env"
 	"istio.io/pkg/log"
 )
@@ -51,8 +52,8 @@ const (
 	// The ID/name for the k8sKey in kubernetes tls secret.
 	tlsScrtKey = "tls.key"
 
-	// IngressSecretNameSpace the namespace of kubernetes secrets to watch.
-	ingressSecretNameSpace = "INGRESS_GATEWAY_NAMESPACE"
+	// IngressSecretNamespace the namespace of kubernetes secrets to watch.
+	ingressSecretNamespace = "INGRESS_GATEWAY_NAMESPACE"
 
 	// IngressGatewaySdsCaSuffix is the suffix of the sds resource name for root CA. All resource
 	// names for ingress gateway root certs end with "-cacert".
@@ -102,6 +103,9 @@ type SecretFetcher struct {
 	// gateway-fallback as default name of fallback secret. If a fallback secret exists,
 	// FindIngressGatewaySecret returns this fallback secret when expected secret is not available.
 	FallbackSecretName string
+
+	secretNamespace string
+	coreV1          corev1.CoreV1Interface
 }
 
 func fatalf(template string, args ...interface{}) {
@@ -148,11 +152,15 @@ func (sf *SecretFetcher) Run(ch chan struct{}) {
 	cache.WaitForCacheSync(ch, sf.scrtController.HasSynced)
 }
 
-var namespaceVar = env.RegisterStringVar(ingressSecretNameSpace, "", "")
+var namespaceVar = env.RegisterStringVar(ingressSecretNamespace, "", "")
 
 // InitWithKubeClient initializes SecretFetcher to watch kubernetes secrets.
 func (sf *SecretFetcher) InitWithKubeClient(core corev1.CoreV1Interface) { // nolint:interfacer
-	namespace := namespaceVar.Get()
+	sf.InitWithKubeClientAndNs(core, namespaceVar.Get())
+}
+
+// InitWithKubeClientAndNs initializes SecretFetcher to watch kubernetes secrets.
+func (sf *SecretFetcher) InitWithKubeClientAndNs(core corev1.CoreV1Interface, namespace string) { // nolint:interfacer
 	istioSecretSelector := fields.SelectorFromSet(nil).String()
 	scrtLW := &cache.ListWatch{
 		ListFunc: func(options metav1.ListOptions) (runtime.Object, error) {
@@ -176,6 +184,10 @@ func (sf *SecretFetcher) InitWithKubeClient(core corev1.CoreV1Interface) { // no
 			DeleteFunc: sf.scrtDeleted,
 			UpdateFunc: sf.scrtUpdated,
 		})
+
+	sf.secretNamespace = namespace
+	sf.coreV1 = core
+
 }
 
 // isIngressGatewaySecret checks secret and decides whether this is a secret generated for ingress
@@ -194,24 +206,115 @@ func isIngressGatewaySecret(scrt *v1.Secret) bool {
 	return true
 }
 
-// extractCertAndKey extracts key, certificate and root certificate, and indicates whether
-// these key and certificate are empty.
-func extractCertAndKey(scrt *v1.Secret) (cert, key, root []byte, valid bool) {
+// extractCertAndKey extracts server key, certificate, and indicates whether key and cert exist.
+func extractCertAndKey(scrt *v1.Secret) (cert, key []byte, exist bool) {
 	certAndKeyExist := false
 	if len(scrt.Data[genericScrtCert]) > 0 {
 		cert = scrt.Data[genericScrtCert]
 		key = scrt.Data[genericScrtKey]
-		root = scrt.Data[genericScrtCaCert]
 	} else {
 		cert = scrt.Data[tlsScrtCert]
 		key = scrt.Data[tlsScrtKey]
-		root = []byte{}
 	}
-	// root could be empty if ingress gateway only accepts TLS.
 	if len(cert) > 0 && len(key) > 0 {
 		certAndKeyExist = true
 	}
-	return cert, key, root, certAndKeyExist
+
+	return cert, key, certAndKeyExist
+}
+
+// extractCACert extracts the client CA certificate from either the Compound
+// Secret, or from a separate Kubernetes TLS secret that has CA cert in `tls.crt` field.
+func extractCACert(scrt *v1.Secret, fromCompoundSecret bool) (caCert []byte, exist bool) {
+	if len(scrt.Data[genericScrtCaCert]) > 0 {
+		caCert = scrt.Data[genericScrtCaCert]
+	} else if !fromCompoundSecret {
+		caCert = scrt.Data[tlsScrtCert]
+	}
+
+	return caCert, len(caCert) > 0
+}
+
+// extractK8sSecretIntoSecretItem extracts a server cert/key pair and a client CA
+// certificate from the k8s Secret into a pair of SecretItems. Returns SecretItems and a boolean
+// indicating whether this is a CA only k8s Secret.
+// A CA only k8s secret has name suffix `-cacert`, and is ONLY considered for a client CA;
+// either a `cacert` or `tls.crt` must be provided.
+// Otherwise the Secret can hold a server cert/key pair in `tls.crt`/`tls.key`,
+// or a server cert/key pair in `cert`/`key` and an optional client CA cert in
+// `-cacert`. A Secret with server cert/key and client CA cert is considered as a compound secret.
+func extractK8sSecretIntoSecretItem(scrt *v1.Secret, t time.Time) (serverItem, clientCAItem *model.SecretItem, isCAOnlySecret bool) {
+	resourceName := scrt.GetName()
+	isCAOnlySecret = strings.HasSuffix(resourceName, IngressGatewaySdsCaSuffix)
+
+	// Extract CA cert from CA only k8s secret.
+	if isCAOnlySecret {
+		caCert, exist := extractCACert(scrt, false /* fromCompoundSecret */)
+		if !exist {
+			secretFetcherLog.Warnf("failed load CA only secret from %s: no 'cacert' or 'tls.crt' key in the secret", resourceName)
+			return nil, nil, isCAOnlySecret
+		}
+		rootCertExpireTime, err := nodeagentutil.ParseCertAndGetExpiryTimestamp(caCert)
+		if err != nil {
+			secretFetcherLog.Warnf("skip loading secret. Kubernetes secret %v contains a root "+
+				"certificate that fails to parse: %v", resourceName, err)
+			return nil, nil, isCAOnlySecret
+		}
+
+		certificateAuthorityNewSecret := &model.SecretItem{
+			ResourceName:                  resourceName,
+			CreatedTime:                   t,
+			Version:                       t.String(),
+			RootCertOwnedByCompoundSecret: false,
+			RootCert:                      caCert,
+			ExpireTime:                    rootCertExpireTime,
+		}
+
+		return nil, certificateAuthorityNewSecret, isCAOnlySecret
+	}
+
+	// Extract server key/cert from k8s secret.
+	cert, key, keyCertExist := extractCertAndKey(scrt)
+	if !keyCertExist {
+		secretFetcherLog.Warnf("failed load server cert/key pair from secret %s: server cert or private key is empty", resourceName)
+		return nil, nil, isCAOnlySecret
+	}
+	certExpireTime, err := nodeagentutil.ParseCertAndGetExpiryTimestamp(cert)
+	if err != nil {
+		secretFetcherLog.Warnf("skip loading secret. Kubernetes secret %v contains a server "+
+			"certificate that fails to parse: %v", resourceName, err)
+		return nil, nil, isCAOnlySecret
+	}
+	newSecret := &model.SecretItem{
+		ResourceName:     resourceName,
+		CreatedTime:      t,
+		Version:          t.String(),
+		CertificateChain: cert,
+		ExpireTime:       certExpireTime,
+		PrivateKey:       key,
+	}
+
+	// Try to extract CA cert from k8s secret.
+	caCert, caCertExist := extractCACert(scrt, true /* fromCompoundSecret */)
+	if caCertExist {
+		rootCertExpireTime, err := nodeagentutil.ParseCertAndGetExpiryTimestamp(caCert)
+		if err != nil {
+			secretFetcherLog.Warnf("skip loading secret. Kubernetes secret %v contains a root "+
+				"certificate that fails to parse: %v", resourceName, err)
+			return nil, nil, isCAOnlySecret
+		}
+		certificateAuthorityNewSecret := &model.SecretItem{
+			ResourceName:                  resourceName + IngressGatewaySdsCaSuffix,
+			CreatedTime:                   t,
+			Version:                       t.String(),
+			RootCert:                      caCert,
+			ExpireTime:                    rootCertExpireTime,
+			RootCertOwnedByCompoundSecret: true,
+		}
+		return newSecret, certificateAuthorityNewSecret, isCAOnlySecret
+	}
+
+	return newSecret, nil, isCAOnlySecret
 }
 
 func (sf *SecretFetcher) scrtAdded(obj interface{}) {
@@ -228,40 +331,35 @@ func (sf *SecretFetcher) scrtAdded(obj interface{}) {
 	}
 
 	t := time.Now()
-	newCert, newKey, newRoot, valid := extractCertAndKey(scrt)
-	if !valid {
-		secretFetcherLog.Warnf("Secret object: %v has empty field, skip adding secret", resourceName)
+	newSecret, certificateAuthorityNewSecret, isCaOnly := extractK8sSecretIntoSecretItem(scrt, t)
+
+	// Load CA cert from CA only k8s secret and update cache.
+	if isCaOnly && certificateAuthorityNewSecret != nil {
+		sf.secrets.Delete(certificateAuthorityNewSecret.ResourceName)
+		sf.secrets.Store(certificateAuthorityNewSecret.ResourceName, *certificateAuthorityNewSecret)
+		secretFetcherLog.Debugf("secret %s is added as a client CA cert", certificateAuthorityNewSecret.ResourceName)
+		if sf.AddCache != nil {
+			sf.AddCache(certificateAuthorityNewSecret.ResourceName, *certificateAuthorityNewSecret)
+		}
 		return
 	}
-	// If there is secret with the same resource name, delete that secret now.
-	sf.secrets.Delete(resourceName)
-	ns := &model.SecretItem{
-		ResourceName:     resourceName,
-		CertificateChain: newCert,
-		PrivateKey:       newKey,
-		CreatedTime:      t,
-		Version:          t.String(),
-	}
-	sf.secrets.Store(resourceName, *ns)
-	secretFetcherLog.Debugf("secret %s is added", resourceName)
-	if sf.AddCache != nil {
-		sf.AddCache(resourceName, *ns)
-	}
 
-	rootCertResourceName := resourceName + IngressGatewaySdsCaSuffix
-	// If there is root cert secret with the same resource name, delete that secret now.
-	sf.secrets.Delete(rootCertResourceName)
-	if len(newRoot) > 0 {
-		nsRoot := &model.SecretItem{
-			ResourceName: rootCertResourceName,
-			RootCert:     newRoot,
-			CreatedTime:  t,
-			Version:      t.String(),
-		}
-		sf.secrets.Store(rootCertResourceName, *nsRoot)
-		secretFetcherLog.Debugf("secret %s is added", rootCertResourceName)
+	if newSecret != nil {
+		// Load server key/cert from k8s secret and update cache.
+		sf.secrets.Delete(newSecret.ResourceName)
+		sf.secrets.Store(newSecret.ResourceName, *newSecret)
+		secretFetcherLog.Debugf("secret %s is added as a server certificate", newSecret.ResourceName)
 		if sf.AddCache != nil {
-			sf.AddCache(rootCertResourceName, *nsRoot)
+			sf.AddCache(newSecret.ResourceName, *newSecret)
+		}
+		if certificateAuthorityNewSecret != nil {
+			// Load client CA cert from compound k8s secret and update cache.
+			sf.secrets.Delete(certificateAuthorityNewSecret.ResourceName)
+			sf.secrets.Store(certificateAuthorityNewSecret.ResourceName, *certificateAuthorityNewSecret)
+			secretFetcherLog.Debugf("secret %s is added as a client CA cert (from a compound Secret)", certificateAuthorityNewSecret.ResourceName)
+			if sf.AddCache != nil {
+				sf.AddCache(certificateAuthorityNewSecret.ResourceName, *certificateAuthorityNewSecret)
+			}
 		}
 	}
 }
@@ -282,12 +380,17 @@ func (sf *SecretFetcher) scrtDeleted(obj interface{}) {
 	}
 
 	rootCertResourceName := key + IngressGatewaySdsCaSuffix
-	// If there is root cert secret with the same resource name, delete that secret now.
-	sf.secrets.Delete(rootCertResourceName)
-	secretFetcherLog.Infof("secret %s is deleted", rootCertResourceName)
-	// Delete all cache entries that match the deleted key.
-	if sf.DeleteCache != nil {
-		sf.DeleteCache(rootCertResourceName)
+	rootSecret, exists := sf.secrets.Load(rootCertResourceName)
+	// If there is a root cert secret with the same resource name and it's owned
+	// by the compound K8S secret, delete it now.
+	if exists && rootSecret.(model.SecretItem).RootCertOwnedByCompoundSecret {
+		// If there is root cert secret with the same resource name, delete that secret now.
+		sf.secrets.Delete(rootCertResourceName)
+		secretFetcherLog.Infof("secret %s is deleted", rootCertResourceName)
+		// Delete all cache entries that match the deleted key.
+		if sf.DeleteCache != nil {
+			sf.DeleteCache(rootCertResourceName)
+		}
 	}
 }
 
@@ -311,52 +414,81 @@ func (sf *SecretFetcher) scrtUpdated(oldObj, newObj interface{}) {
 	}
 
 	if !isIngressGatewaySecret(nscrt) {
-		secretFetcherLog.Debugf("secret %s is not an ingress gateway secret, skip update", newScrtName)
+		secretFetcherLog.Debugf("kubernetes secret %s is not an ingress gateway secret, skip update", newScrtName)
 		return
 	}
 
-	oldCert, oldKey, oldRoot, _ := extractCertAndKey(oscrt)
-	newCert, newKey, newRoot, valid := extractCertAndKey(nscrt)
-	if !valid {
-		secretFetcherLog.Warnf("Secret object: %v has empty field, skip update", newScrtName)
-		return
-	}
-	if bytes.Equal(oldCert, newCert) && bytes.Equal(oldKey, newKey) && bytes.Equal(oldRoot, newRoot) {
-		secretFetcherLog.Debugf("secret %s does not change, skip update", oldScrtName)
-		return
-	}
-	sf.secrets.Delete(oldScrtName)
-
+	secretFetcherLog.Infof("scrtUpdated is called on kubernetes secret %s", newScrtName)
+	// Kubernetes secret update is done by deleting first and creating a new one with the same name.
+	// Accordingly scrtDeleted and scrtAdded are called. When scrtUpdated is called, secret should remain unchanged.
 	t := time.Now()
-	ns := &model.SecretItem{
-		ResourceName:     newScrtName,
-		CertificateChain: newCert,
-		PrivateKey:       newKey,
-		CreatedTime:      t,
-		Version:          t.String(),
-	}
-	sf.secrets.Store(newScrtName, *ns)
-	secretFetcherLog.Infof("secret %s is updated", newScrtName)
-	if sf.UpdateCache != nil {
-		sf.UpdateCache(newScrtName, *ns)
+	oldScrt, oldCaScrt, _ := extractK8sSecretIntoSecretItem(oscrt, t)
+	newScrt, newCaScrt, isCaOnlyNew := extractK8sSecretIntoSecretItem(nscrt, t)
+	updateSecret := shouldUpdateSecret(oldScrt, oldCaScrt, newScrt, newCaScrt)
+	if !updateSecret {
+		secretFetcherLog.Infof("secret %s does not change, skip update", newScrtName)
+		return
 	}
 
-	rootCertResourceName := newScrtName + IngressGatewaySdsCaSuffix
-	// If there is root cert secret with the same resource name, delete that secret now.
-	sf.secrets.Delete(rootCertResourceName)
-	if len(newRoot) > 0 {
-		nsRoot := &model.SecretItem{
-			ResourceName: rootCertResourceName,
-			RootCert:     newRoot,
-			CreatedTime:  t,
-			Version:      t.String(),
-		}
-		sf.secrets.Store(rootCertResourceName, *nsRoot)
-		secretFetcherLog.Infof("secret %s is updated", rootCertResourceName)
-		if sf.UpdateCache != nil {
-			sf.UpdateCache(rootCertResourceName, *nsRoot)
+	if oldScrt != nil || newScrt != nil {
+		sf.updateSecretInCache(oldScrt, newScrt)
+		secretFetcherLog.Debugf("secret %s is updated as a server certificate", newScrt.ResourceName)
+	}
+	if oldCaScrt != nil || newCaScrt != nil {
+		sf.updateSecretInCache(oldCaScrt, newCaScrt)
+		if isCaOnlyNew {
+			secretFetcherLog.Debugf("secret %s is updated as a client CA cert (from a CA only secret)",
+				newCaScrt.ResourceName)
+		} else {
+			secretFetcherLog.Debugf("secret %s is updated as a client CA cert (from a compound Secret)",
+				newCaScrt.ResourceName)
 		}
 	}
+}
+
+// updateSecretInCache updates secret in cache, and pushes to client when new certs
+// are reloaded from secret.
+func (sf *SecretFetcher) updateSecretInCache(oldScrt, newScrt *model.SecretItem) {
+	if oldScrt != nil {
+		sf.secrets.Delete(oldScrt.ResourceName)
+	}
+	if newScrt != nil {
+		sf.secrets.Store(newScrt.ResourceName, *newScrt)
+		if sf.UpdateCache != nil {
+			sf.UpdateCache(newScrt.ResourceName, *newScrt)
+		}
+	} else if oldScrt != nil {
+		if sf.DeleteCache != nil {
+			sf.DeleteCache(oldScrt.ResourceName)
+		}
+	}
+}
+
+// shouldUpdateSecret indicates whether secret update is required to reload new secret.
+func shouldUpdateSecret(oldScrt, oldCaScrt, newScrt, newCaScrt *model.SecretItem) bool {
+	if newScrt == nil && newCaScrt == nil {
+		return false
+	}
+
+	if (oldScrt != nil && newScrt == nil) || (oldScrt == nil && newScrt != nil) {
+		return true
+	}
+	if newScrt != nil && oldScrt != nil {
+		if !bytes.Equal(oldScrt.CertificateChain, newScrt.CertificateChain) ||
+			!bytes.Equal(oldScrt.PrivateKey, newScrt.PrivateKey) {
+			return true
+		}
+	}
+
+	if (oldCaScrt != nil && newCaScrt == nil) || (oldCaScrt == nil && newCaScrt != nil) {
+		return true
+	}
+	if oldCaScrt != nil && newCaScrt != nil {
+		if !bytes.Equal(oldCaScrt.RootCert, newCaScrt.RootCert) {
+			return true
+		}
+	}
+	return false
 }
 
 // FindIngressGatewaySecret returns the secret whose name matches the key, or empty secret if no
@@ -367,6 +499,22 @@ func (sf *SecretFetcher) FindIngressGatewaySecret(key string) (secret model.Secr
 	val, exist := sf.secrets.Load(key)
 	secretFetcherLog.Debugf("load secret %s from secret fetcher: %v", key, exist)
 	if !exist {
+		// Sometimes we see that a secret in installed but not in cache because watcher is in an
+		// obsolete state and wasn't reset promptly. We bail this case out by trying fetching
+		// the secret from API call. Since this is a rare case, to avoid complication, we don't add
+		// the secret back to cache as it is not a normal codepath. When watcher recovers, those secret
+		// shall be added back. Note that this approach only covers the TLS server key/cert fetching.
+		if sf.coreV1 != nil {
+			if secret, err := sf.coreV1.Secrets(sf.secretNamespace).Get(key, metav1.GetOptions{}); err == nil {
+				secretItem, _, _ := extractK8sSecretIntoSecretItem(secret, time.Now())
+				if secretItem != nil {
+					secretFetcherLog.Infof("Return secret %s found by direct api call", key)
+					return *secretItem, true
+				}
+				secretFetcherLog.Infof("Fail to extract secret %s found by direct api call", key)
+			}
+		}
+
 		// Expected secret does not exist, try to find the fallback secret.
 		// TODO(JimmyCYJ): Add metrics to node agent to imply usage of fallback secret
 		secretFetcherLog.Warnf("Cannot find secret %s, searching for fallback secret %s", key, sf.FallbackSecretName)

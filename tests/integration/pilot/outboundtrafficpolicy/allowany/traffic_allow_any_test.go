@@ -28,7 +28,6 @@ func TestMain(m *testing.M) {
 	var ist istio.Instance
 	framework.
 		NewSuite("outbound_traffic_policy_allow_any", m).
-		RequireEnvironment(environment.Kube).
 		Label(label.CustomSetup).
 		SetupOnEnv(environment.Kube, istio.Setup(&ist, setupConfig)).
 		Run()
@@ -39,7 +38,6 @@ func setupConfig(cfg *istio.Config) {
 		return
 	}
 	cfg.Values["global.outboundTrafficPolicy.mode"] = "ALLOW_ANY"
-	cfg.Values["pilot.env.PILOT_ENABLE_FALLTHROUGH_ROUTE"] = "true"
 }
 
 func TestOutboundTrafficPolicyAllowAny(t *testing.T) {

@@ -44,7 +44,7 @@ import (
 //     startTime: request.time
 //     endTime: response.time
 //     clientSpan: (context.reporter.kind | "inbound") == "outbound"
-//     rewriteClientSpanId: false
+//     rewriteClientSpanId: "false"
 //     spanTags:
 //       http.method: request.method | ""
 //       http.status_code: response.code | 200
@@ -55,7 +55,7 @@ import (
 //       source.version: source.labels["version"] | ""
 // ```
 //
-// See also: [Distributed Tracing](https://istio.io/docs/tasks/telemetry/distributed-tracing/)
+// See also: [Distributed Tracing](https://istio.io/docs/tasks/observability/distributed-tracing/)
 // for information on tracing within Istio.
 
 // Fully qualified name of the template

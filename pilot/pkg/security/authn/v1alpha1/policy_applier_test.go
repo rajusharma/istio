@@ -15,27 +15,33 @@
 package v1alpha1
 
 import (
+	"os"
 	"reflect"
 	"testing"
 
-	"github.com/envoyproxy/go-control-plane/envoy/api/v2/auth"
-	"github.com/envoyproxy/go-control-plane/envoy/api/v2/core"
-	"github.com/envoyproxy/go-control-plane/envoy/api/v2/listener"
+	"github.com/davecgh/go-spew/spew"
+	auth "github.com/envoyproxy/go-control-plane/envoy/api/v2/auth"
+	core "github.com/envoyproxy/go-control-plane/envoy/api/v2/core"
+	listener "github.com/envoyproxy/go-control-plane/envoy/api/v2/listener"
+	route "github.com/envoyproxy/go-control-plane/envoy/api/v2/route"
+	envoy_jwt "github.com/envoyproxy/go-control-plane/envoy/config/filter/http/jwt_authn/v2alpha"
 	http_conn "github.com/envoyproxy/go-control-plane/envoy/config/filter/network/http_connection_manager/v2"
-	"github.com/gogo/protobuf/types"
-
-	"istio.io/istio/pilot/pkg/features"
+	"github.com/golang/protobuf/proto"
+	"github.com/golang/protobuf/ptypes/empty"
+	structpb "github.com/golang/protobuf/ptypes/struct"
 
 	authn "istio.io/api/authentication/v1alpha1"
-	authn_filter "istio.io/api/envoy/config/filter/http/authn/v2alpha1"
-	jwtfilter "istio.io/api/envoy/config/filter/http/jwt_auth/v2alpha1"
 
+	"istio.io/istio/pilot/pkg/features"
 	"istio.io/istio/pilot/pkg/model"
 	"istio.io/istio/pilot/pkg/model/test"
 	"istio.io/istio/pilot/pkg/networking/plugin"
 	pilotutil "istio.io/istio/pilot/pkg/networking/util"
 	authn_model "istio.io/istio/pilot/pkg/security/model"
-	"istio.io/istio/pkg/proto"
+	protovalue "istio.io/istio/pkg/proto"
+	authn_filter_policy "istio.io/istio/security/proto/authentication/v1alpha1"
+	authn_filter "istio.io/istio/security/proto/envoy/config/filter/http/authn/v2alpha1"
+	istio_jwt "istio.io/istio/security/proto/envoy/config/filter/http/jwt_auth/v2alpha1"
 )
 
 func TestRequireTls(t *testing.T) {
@@ -192,6 +198,13 @@ func TestCollectJwtSpecs(t *testing.T) {
 	}
 }
 
+func setUseIstioJWTFilter(value string, t *testing.T) {
+	err := os.Setenv(features.UseIstioJWTFilter.Name, value)
+	if err != nil {
+		t.Fatalf("failed to set enable Istio JWT filter: %v", err)
+	}
+}
+
 func TestConvertPolicyToJwtConfig(t *testing.T) {
 	ms, err := test.StartNewServer()
 	if err != nil {
@@ -201,8 +214,10 @@ func TestConvertPolicyToJwtConfig(t *testing.T) {
 	jwksURI := ms.URL + "/oauth2/v3/certs"
 
 	cases := []struct {
-		in       *authn.Policy
-		expected *jwtfilter.JwtAuthentication
+		in          *authn.Policy
+		useIstioJWT bool
+		wantName    string
+		wantConfig  proto.Message
 	}{
 		{
 			in: &authn.Policy{
@@ -216,27 +231,182 @@ func TestConvertPolicyToJwtConfig(t *testing.T) {
 					},
 				},
 			},
-			expected: &jwtfilter.JwtAuthentication{
-				Rules: []*jwtfilter.JwtRule{
+			wantName:    "jwt-auth",
+			useIstioJWT: true,
+			wantConfig: &istio_jwt.JwtAuthentication{
+				Rules: []*istio_jwt.JwtRule{
 					{
-						JwksSourceSpecifier: &jwtfilter.JwtRule_LocalJwks{
-							LocalJwks: &jwtfilter.DataSource{
-								Specifier: &jwtfilter.DataSource_InlineString{
+						JwksSourceSpecifier: &istio_jwt.JwtRule_LocalJwks{
+							LocalJwks: &istio_jwt.DataSource{
+								Specifier: &istio_jwt.DataSource_InlineString{
 									InlineString: test.JwtPubKey1,
 								},
 							},
 						},
 						Forward:              true,
-						ForwardPayloadHeader: "istio-sec-da39a3ee5e6b4b0d3255bfef95601890afd80709"},
+						ForwardPayloadHeader: "istio-sec-da39a3ee5e6b4b0d3255bfef95601890afd80709",
+					},
 				},
 				AllowMissingOrFailed: true,
+			},
+		},
+		{
+			in: &authn.Policy{
+				Peers: []*authn.PeerAuthenticationMethod{
+					{
+						Params: &authn.PeerAuthenticationMethod_Jwt{
+							Jwt: &authn.Jwt{
+								Jwks: test.JwtPubKey1,
+							},
+						},
+					},
+				},
+			},
+			wantName:    "jwt-auth",
+			useIstioJWT: true,
+			wantConfig: &istio_jwt.JwtAuthentication{
+				Rules: []*istio_jwt.JwtRule{
+					{
+						JwksSourceSpecifier: &istio_jwt.JwtRule_LocalJwks{
+							LocalJwks: &istio_jwt.DataSource{
+								Specifier: &istio_jwt.DataSource_InlineString{
+									InlineString: test.JwtPubKey1,
+								},
+							},
+						},
+						Forward:              true,
+						ForwardPayloadHeader: "istio-sec-da39a3ee5e6b4b0d3255bfef95601890afd80709",
+					},
+				},
+				AllowMissingOrFailed: true,
+			},
+		},
+		{
+			in: &authn.Policy{
+				Origins: []*authn.OriginAuthenticationMethod{
+					{
+						Jwt: &authn.Jwt{
+							Issuer:     "issuer-0",
+							JwksUri:    jwksURI,
+							JwtHeaders: []string{exchangedTokenHeaderName, "custom"},
+						},
+					},
+					{
+						Jwt: &authn.Jwt{
+							Issuer:  "issuer-1",
+							JwksUri: jwksURI,
+						},
+					},
+				},
+			},
+			wantName: "envoy.filters.http.jwt_authn",
+			wantConfig: &envoy_jwt.JwtAuthentication{
+				Rules: []*envoy_jwt.RequirementRule{
+					{
+						Match: &route.RouteMatch{
+							PathSpecifier: &route.RouteMatch_Prefix{
+								Prefix: "/",
+							},
+						},
+						Requires: &envoy_jwt.JwtRequirement{
+							RequiresType: &envoy_jwt.JwtRequirement_AllowMissingOrFailed{
+								AllowMissingOrFailed: &empty.Empty{},
+							},
+						},
+					},
+				},
+				Providers: map[string]*envoy_jwt.JwtProvider{
+					"origins-0": {
+						Issuer: "issuer-0",
+						JwksSourceSpecifier: &envoy_jwt.JwtProvider_LocalJwks{
+							LocalJwks: &core.DataSource{
+								Specifier: &core.DataSource_InlineString{
+									InlineString: test.JwtPubKey1,
+								},
+							},
+						},
+						Forward:           true,
+						PayloadInMetadata: "issuer-0",
+						FromHeaders: []*envoy_jwt.JwtHeader{
+							{
+								Name:        exchangedTokenHeaderName,
+								ValuePrefix: exchangedTokenHeaderPrefix,
+							},
+							{
+								Name: "custom",
+							},
+						},
+					},
+					"origins-1": {
+						Issuer: "issuer-1",
+						JwksSourceSpecifier: &envoy_jwt.JwtProvider_LocalJwks{
+							LocalJwks: &core.DataSource{
+								Specifier: &core.DataSource_InlineString{
+									InlineString: test.JwtPubKey1,
+								},
+							},
+						},
+						Forward:           true,
+						PayloadInMetadata: "issuer-1",
+					},
+				},
+			},
+		},
+		{
+			in: &authn.Policy{
+				Origins: []*authn.OriginAuthenticationMethod{
+					{
+						Jwt: &authn.Jwt{
+							Issuer: "issuer-1",
+							Jwks:   test.JwtPubKey2,
+						},
+					},
+				},
+			},
+			wantName: "envoy.filters.http.jwt_authn",
+			wantConfig: &envoy_jwt.JwtAuthentication{
+				Rules: []*envoy_jwt.RequirementRule{
+					{
+						Match: &route.RouteMatch{
+							PathSpecifier: &route.RouteMatch_Prefix{
+								Prefix: "/",
+							},
+						},
+						Requires: &envoy_jwt.JwtRequirement{
+							RequiresType: &envoy_jwt.JwtRequirement_AllowMissingOrFailed{
+								AllowMissingOrFailed: &empty.Empty{},
+							},
+						},
+					},
+				},
+				Providers: map[string]*envoy_jwt.JwtProvider{
+					"origins-0": {
+						Issuer: "issuer-1",
+						JwksSourceSpecifier: &envoy_jwt.JwtProvider_LocalJwks{
+							LocalJwks: &core.DataSource{
+								Specifier: &core.DataSource_InlineString{
+									InlineString: test.JwtPubKey2,
+								},
+							},
+						},
+						Forward:           true,
+						PayloadInMetadata: "issuer-1",
+					},
+				},
 			},
 		},
 	}
 
 	for _, c := range cases {
-		if got := convertPolicyToJwtConfig(c.in); !reflect.DeepEqual(c.expected, got) {
-			t.Errorf("ConvertPolicyToJwtConfig(%#v), got:\n%#v\nwanted:\n%#v\n", c.in, got, c.expected)
+		if c.useIstioJWT {
+			setUseIstioJWTFilter("true", t)
+		}
+		if gotName, gotCfg := convertPolicyToJwtConfig(c.in); gotName != c.wantName || !reflect.DeepEqual(c.wantConfig, gotCfg) {
+			t.Errorf("ConvertPolicyToJwtConfig(%#v), got:\n%s\n%#v\nwanted:\n%s\n%#v\n",
+				c.in, gotName, spew.Sdump(gotCfg), c.wantName, spew.Sdump(c.wantConfig))
+		}
+		if c.useIstioJWT {
+			setUseIstioJWTFilter("false", t)
 		}
 	}
 }
@@ -249,6 +419,10 @@ func TestBuildJwtFilter(t *testing.T) {
 
 	jwksURI := ms.URL + "/oauth2/v3/certs"
 
+	setUseIstioJWTFilter("true", t)
+	defer func() {
+		setUseIstioJWTFilter("false", t)
+	}()
 	cases := []struct {
 		in       *authn.Policy
 		expected *http_conn.HttpFilter
@@ -277,15 +451,15 @@ func TestBuildJwtFilter(t *testing.T) {
 				Name: "jwt-auth",
 				ConfigType: &http_conn.HttpFilter_TypedConfig{
 					TypedConfig: pilotutil.MessageToAny(
-						&jwtfilter.JwtAuthentication{
+						&istio_jwt.JwtAuthentication{
 							AllowMissingOrFailed: true,
-							Rules: []*jwtfilter.JwtRule{
+							Rules: []*istio_jwt.JwtRule{
 								{
 									Forward:              true,
 									ForwardPayloadHeader: "istio-sec-da39a3ee5e6b4b0d3255bfef95601890afd80709",
-									JwksSourceSpecifier: &jwtfilter.JwtRule_LocalJwks{
-										LocalJwks: &jwtfilter.DataSource{
-											Specifier: &jwtfilter.DataSource_InlineString{
+									JwksSourceSpecifier: &istio_jwt.JwtRule_LocalJwks{
+										LocalJwks: &istio_jwt.DataSource{
+											Specifier: &istio_jwt.DataSource_InlineString{
 												InlineString: test.JwtPubKey1,
 											},
 										},
@@ -325,14 +499,14 @@ func TestConvertPolicyToAuthNFilterConfig(t *testing.T) {
 			name: "no jwt policy",
 			in: &authn.Policy{
 				Peers: []*authn.PeerAuthenticationMethod{{
-					Params: &authn.PeerAuthenticationMethod_Mtls{},
+					Params: &authn.PeerAuthenticationMethod_Mtls{&authn.MutualTls{}},
 				}},
 			},
 			expected: &authn_filter.FilterConfig{
-				Policy: &authn.Policy{
-					Peers: []*authn.PeerAuthenticationMethod{{
-						Params: &authn.PeerAuthenticationMethod_Mtls{
-							&authn.MutualTls{},
+				Policy: &authn_filter_policy.Policy{
+					Peers: []*authn_filter_policy.PeerAuthenticationMethod{{
+						Params: &authn_filter_policy.PeerAuthenticationMethod_Mtls{
+							&authn_filter_policy.MutualTls{},
 						},
 					}},
 				},
@@ -352,11 +526,11 @@ func TestConvertPolicyToAuthNFilterConfig(t *testing.T) {
 				},
 			},
 			expected: &authn_filter.FilterConfig{
-				Policy: &authn.Policy{
-					Peers: []*authn.PeerAuthenticationMethod{
+				Policy: &authn_filter_policy.Policy{
+					Peers: []*authn_filter_policy.PeerAuthenticationMethod{
 						{
-							Params: &authn.PeerAuthenticationMethod_Jwt{
-								Jwt: &authn.Jwt{
+							Params: &authn_filter_policy.PeerAuthenticationMethod_Jwt{
+								Jwt: &authn_filter_policy.Jwt{
 									Issuer: "foo",
 								},
 							},
@@ -385,7 +559,7 @@ func TestConvertPolicyToAuthNFilterConfig(t *testing.T) {
 						},
 					},
 					{
-						Params: &authn.PeerAuthenticationMethod_Mtls{},
+						Params: &authn.PeerAuthenticationMethod_Mtls{&authn.MutualTls{}},
 					},
 				},
 				Origins: []*authn.OriginAuthenticationMethod{
@@ -397,24 +571,24 @@ func TestConvertPolicyToAuthNFilterConfig(t *testing.T) {
 				},
 			},
 			expected: &authn_filter.FilterConfig{
-				Policy: &authn.Policy{
-					Peers: []*authn.PeerAuthenticationMethod{
+				Policy: &authn_filter_policy.Policy{
+					Peers: []*authn_filter_policy.PeerAuthenticationMethod{
 						{
-							Params: &authn.PeerAuthenticationMethod_Jwt{
-								Jwt: &authn.Jwt{
+							Params: &authn_filter_policy.PeerAuthenticationMethod_Jwt{
+								Jwt: &authn_filter_policy.Jwt{
 									Issuer: "foo",
 								},
 							},
 						},
 						{
-							Params: &authn.PeerAuthenticationMethod_Mtls{
-								&authn.MutualTls{},
+							Params: &authn_filter_policy.PeerAuthenticationMethod_Mtls{
+								&authn_filter_policy.MutualTls{},
 							},
 						},
 					},
-					Origins: []*authn.OriginAuthenticationMethod{
+					Origins: []*authn_filter_policy.OriginAuthenticationMethod{
 						{
-							Jwt: &authn.Jwt{
+							Jwt: &authn_filter_policy.Jwt{
 								Issuer: "bar",
 							},
 						},
@@ -429,15 +603,23 @@ func TestConvertPolicyToAuthNFilterConfig(t *testing.T) {
 	}
 	for _, c := range cases {
 		if got := convertPolicyToAuthNFilterConfig(c.in, model.SidecarProxy); !reflect.DeepEqual(c.expected, got) {
-			t.Errorf("Test case %s: expected\n%#v\n, got\n%#v", c.name, c.expected.String(), got.String())
+			t.Errorf("Test case %s: wantConfig\n%#v\n, got\n%#v", c.name, c.expected.String(), got.String())
 		}
+	}
+}
+
+func setSkipValidateTrustDomain(value string, t *testing.T) {
+	err := os.Setenv(features.SkipValidateTrustDomain.Name, value)
+	if err != nil {
+		t.Fatalf("failed to set SkipValidateTrustDomain: %v", err)
 	}
 }
 
 func TestBuildAuthNFilter(t *testing.T) {
 	cases := []struct {
-		in                   *authn.Policy
-		expectedFilterConfig *authn_filter.FilterConfig
+		in                      *authn.Policy
+		expectedFilterConfig    *authn_filter.FilterConfig
+		skipTrustDomainValidate bool
 	}{
 
 		{
@@ -461,11 +643,11 @@ func TestBuildAuthNFilter(t *testing.T) {
 				},
 			},
 			expectedFilterConfig: &authn_filter.FilterConfig{
-				Policy: &authn.Policy{
-					Peers: []*authn.PeerAuthenticationMethod{
+				Policy: &authn_filter_policy.Policy{
+					Peers: []*authn_filter_policy.PeerAuthenticationMethod{
 						{
-							Params: &authn.PeerAuthenticationMethod_Jwt{
-								Jwt: &authn.Jwt{
+							Params: &authn_filter_policy.PeerAuthenticationMethod_Jwt{
+								Jwt: &authn_filter_policy.Jwt{
 									JwksUri: "http://abc.com",
 								},
 							},
@@ -477,9 +659,61 @@ func TestBuildAuthNFilter(t *testing.T) {
 				},
 			},
 		},
+		{
+			in: &authn.Policy{
+				Peers: []*authn.PeerAuthenticationMethod{
+					{
+						Params: &authn.PeerAuthenticationMethod_Mtls{
+							Mtls: &authn.MutualTls{},
+						},
+					},
+				},
+			},
+			expectedFilterConfig: &authn_filter.FilterConfig{
+				Policy: &authn_filter_policy.Policy{
+					Peers: []*authn_filter_policy.PeerAuthenticationMethod{
+						{
+							Params: &authn_filter_policy.PeerAuthenticationMethod_Mtls{
+								Mtls: &authn_filter_policy.MutualTls{},
+							},
+						},
+					},
+				},
+			},
+		},
+		{
+			in: &authn.Policy{
+				Peers: []*authn.PeerAuthenticationMethod{
+					{
+						Params: &authn.PeerAuthenticationMethod_Mtls{
+							Mtls: &authn.MutualTls{},
+						},
+					},
+				},
+			},
+			skipTrustDomainValidate: true,
+			expectedFilterConfig: &authn_filter.FilterConfig{
+				Policy: &authn_filter_policy.Policy{
+					Peers: []*authn_filter_policy.PeerAuthenticationMethod{
+						{
+							Params: &authn_filter_policy.PeerAuthenticationMethod_Mtls{
+								Mtls: &authn_filter_policy.MutualTls{},
+							},
+						},
+					},
+				},
+				SkipValidateTrustDomain: true,
+			},
+		},
 	}
 
 	for _, c := range cases {
+		if c.skipTrustDomainValidate {
+			setSkipValidateTrustDomain("true", t)
+			defer func() {
+				setSkipValidateTrustDomain("false", t)
+			}()
+		}
 		got := NewPolicyApplier(c.in).AuthNFilter(model.SidecarProxy, true)
 		if got == nil {
 			if c.expectedFilterConfig != nil {
@@ -489,13 +723,13 @@ func TestBuildAuthNFilter(t *testing.T) {
 			if c.expectedFilterConfig == nil {
 				t.Errorf("buildAuthNFilter(%#v), got: \n%#v\n, wanted none", c.in, got)
 			} else {
-				if got.GetName() != AuthnFilterName {
-					t.Errorf("buildAuthNFilter(%#v), filter name is %s, wanted %s", c.in, got.GetName(), AuthnFilterName)
+				if got.GetName() != authn_model.AuthnFilterName {
+					t.Errorf("buildAuthNFilter(%#v), filter name is %s, wanted %s", c.in, got.GetName(), authn_model.AuthnFilterName)
 				}
-				filterConfig := &authn_filter.FilterConfig{}
-				if err := filterConfig.Unmarshal(got.GetTypedConfig().GetValue()); err != nil {
+				filterConfig := authn_filter.FilterConfig{}
+				if err := proto.Unmarshal(got.GetTypedConfig().GetValue(), &filterConfig); err != nil {
 					t.Errorf("buildAuthNFilter(%#v), bad filter config: %v", c.in, err)
-				} else if !reflect.DeepEqual(c.expectedFilterConfig, filterConfig) {
+				} else if !reflect.DeepEqual(c.expectedFilterConfig, &filterConfig) {
 					t.Errorf("buildAuthNFilter(%#v), got filter config:\n%s\nwanted:\n%s\n", c.in, filterConfig.String(), c.expectedFilterConfig.String())
 				}
 			}
@@ -531,20 +765,19 @@ func TestOnInboundFilterChains(t *testing.T) {
 			},
 			AlpnProtocols: []string{"h2", "http/1.1"},
 		},
-		RequireClientCertificate: proto.BoolTrue,
+		RequireClientCertificate: protovalue.BoolTrue,
 	}
 	cases := []struct {
-		name              string
-		in                *authn.Policy
-		sdsUdsPath        string
-		useTrustworthyJwt bool
-		useNormalJwt      bool
-		expected          []plugin.FilterChain
-		meta              map[string]string
+		name       string
+		in         *authn.Policy
+		sdsUdsPath string
+		expected   []plugin.FilterChain
+		meta       *model.NodeMetadata
 	}{
 		{
 			name: "NoAuthnPolicy",
 			in:   nil,
+			meta: &model.NodeMetadata{},
 			// No need to set up filter chain, default one is okay.
 			expected: nil,
 		},
@@ -561,6 +794,7 @@ func TestOnInboundFilterChains(t *testing.T) {
 					},
 				},
 			},
+			meta:     &model.NodeMetadata{},
 			expected: nil,
 		},
 		{
@@ -572,6 +806,7 @@ func TestOnInboundFilterChains(t *testing.T) {
 					},
 				},
 			},
+			meta: &model.NodeMetadata{},
 			expected: []plugin.FilterChain{
 				{
 					TLSContext: tlsContext,
@@ -591,6 +826,7 @@ func TestOnInboundFilterChains(t *testing.T) {
 					},
 				},
 			},
+			meta: &model.NodeMetadata{},
 			// Only one filter chain with mTLS settings should be generated.
 			expected: []plugin.FilterChain{
 				{
@@ -611,6 +847,7 @@ func TestOnInboundFilterChains(t *testing.T) {
 					},
 				},
 			},
+			meta: &model.NodeMetadata{},
 			// Two filter chains, one for mtls traffic within the mesh, one for plain text traffic.
 			expected: []plugin.FilterChain{
 				{
@@ -618,10 +855,10 @@ func TestOnInboundFilterChains(t *testing.T) {
 					FilterChainMatch: &listener.FilterChainMatch{
 						ApplicationProtocols: []string{"istio"},
 					},
-					ListenerFilters: []listener.ListenerFilter{
+					ListenerFilters: []*listener.ListenerFilter{
 						{
 							Name:       "envoy.listener.tls_inspector",
-							ConfigType: &listener.ListenerFilter_Config{&types.Struct{}},
+							ConfigType: &listener.ListenerFilter_Config{&structpb.Struct{}},
 						},
 					},
 				},
@@ -640,6 +877,7 @@ func TestOnInboundFilterChains(t *testing.T) {
 				},
 			},
 			sdsUdsPath: "/tmp/sdsuds.sock",
+			meta:       &model.NodeMetadata{},
 			expected: []plugin.FilterChain{
 				{
 					TLSContext: &auth.DownstreamTlsContext{
@@ -655,7 +893,7 @@ func TestOnInboundFilterChains(t *testing.T) {
 							},
 							AlpnProtocols: []string{"h2", "http/1.1"},
 						},
-						RequireClientCertificate: proto.BoolTrue,
+						RequireClientCertificate: protovalue.BoolTrue,
 					},
 				},
 			},
@@ -673,10 +911,10 @@ func TestOnInboundFilterChains(t *testing.T) {
 					},
 				},
 			},
-			meta: map[string]string{
-				model.NodeMetadataTLSServerCertChain: "/custom/path/to/cert-chain.pem",
-				model.NodeMetadataTLSServerKey:       "/custom-key.pem",
-				model.NodeMetadataTLSServerRootCert:  "/custom/path/to/root.pem",
+			meta: &model.NodeMetadata{
+				TLSServerCertChain: "/custom/path/to/cert-chain.pem",
+				TLSServerKey:       "/custom-key.pem",
+				TLSServerRootCert:  "/custom/path/to/root.pem",
 			},
 			// Only one filter chain with mTLS settings should be generated.
 			expected: []plugin.FilterChain{
@@ -708,7 +946,7 @@ func TestOnInboundFilterChains(t *testing.T) {
 							},
 							AlpnProtocols: []string{"h2", "http/1.1"},
 						},
-						RequireClientCertificate: proto.BoolTrue,
+						RequireClientCertificate: protovalue.BoolTrue,
 					},
 				},
 			},
@@ -717,8 +955,6 @@ func TestOnInboundFilterChains(t *testing.T) {
 	for _, c := range cases {
 		got := NewPolicyApplier(c.in).InboundFilterChain(
 			c.sdsUdsPath,
-			c.useTrustworthyJwt,
-			c.useNormalJwt,
 			c.meta,
 		)
 		if !reflect.DeepEqual(got, c.expected) {
@@ -728,6 +964,19 @@ func TestOnInboundFilterChains(t *testing.T) {
 }
 
 func constructSDSConfig(name, sdsudspath string) *auth.SdsSecretConfig {
+	gRPCConfig := &core.GrpcService_GoogleGrpc{
+		TargetUri:  sdsudspath,
+		StatPrefix: authn_model.SDSStatPrefix,
+		ChannelCredentials: &core.GrpcService_GoogleGrpc_ChannelCredentials{
+			CredentialSpecifier: &core.GrpcService_GoogleGrpc_ChannelCredentials_LocalCredentials{
+				LocalCredentials: &core.GrpcService_GoogleGrpc_GoogleLocalCredentials{},
+			},
+		},
+	}
+
+	gRPCConfig.CredentialsFactoryName = authn_model.FileBasedMetadataPlugName
+	gRPCConfig.CallCredentials = authn_model.ConstructgRPCCallCredentials(authn_model.K8sSATrustworthyJwtFileName, authn_model.K8sSAJwtTokenHeaderKey)
+
 	return &auth.SdsSecretConfig{
 		Name: name,
 		SdsConfig: &core.ConfigSource{
@@ -738,22 +987,7 @@ func constructSDSConfig(name, sdsudspath string) *auth.SdsSecretConfig {
 					GrpcServices: []*core.GrpcService{
 						{
 							TargetSpecifier: &core.GrpcService_GoogleGrpc_{
-								GoogleGrpc: &core.GrpcService_GoogleGrpc{
-									TargetUri:  sdsudspath,
-									StatPrefix: authn_model.SDSStatPrefix,
-									ChannelCredentials: &core.GrpcService_GoogleGrpc_ChannelCredentials{
-										CredentialSpecifier: &core.GrpcService_GoogleGrpc_ChannelCredentials_LocalCredentials{
-											LocalCredentials: &core.GrpcService_GoogleGrpc_GoogleLocalCredentials{},
-										},
-									},
-									CallCredentials: []*core.GrpcService_GoogleGrpc_CallCredentials{
-										{
-											CredentialSpecifier: &core.GrpcService_GoogleGrpc_CallCredentials_GoogleComputeEngine{
-												GoogleComputeEngine: &types.Empty{},
-											},
-										},
-									},
-								},
+								GoogleGrpc: gRPCConfig,
 							},
 						},
 					},

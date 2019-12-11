@@ -14,6 +14,9 @@
 // dataset/extensions/v1beta1/ingress_merge_0_meshconfig.yaml
 // dataset/extensions/v1beta1/ingress_merge_1.yaml
 // dataset/extensions/v1beta1/ingress_merge_1_expected.json
+// dataset/extensions/v1beta1/ingress_multihost.yaml
+// dataset/extensions/v1beta1/ingress_multihost_expected.json
+// dataset/extensions/v1beta1/ingress_multihost_meshconfig.yaml
 // dataset/mesh.istio.io/v1alpha1/meshconfig.yaml
 // dataset/mesh.istio.io/v1alpha1/meshconfig_expected.json
 // dataset/networking.istio.io/v1alpha3/destinationRule.yaml
@@ -22,6 +25,10 @@
 // dataset/networking.istio.io/v1alpha3/gateway_expected.json
 // dataset/networking.istio.io/v1alpha3/synthetic/serviceEntry.yaml
 // dataset/networking.istio.io/v1alpha3/synthetic/serviceEntry_expected.json
+// dataset/networking.istio.io/v1alpha3/virtualService.yaml
+// dataset/networking.istio.io/v1alpha3/virtualServiceWithUnsupported.yaml
+// dataset/networking.istio.io/v1alpha3/virtualServiceWithUnsupported_expected.json
+// dataset/networking.istio.io/v1alpha3/virtualService_expected.json
 // DO NOT EDIT!
 
 package conversion
@@ -93,7 +100,7 @@ var _datasetConfigIstioIoV1alpha2Circonus_expectedJson = []byte(`{
   "istio/config/v1alpha2/legacy/circonuses": [
     {
       "Metadata": {
-        "name": "valid-circonus"
+        "name": "{{.Namespace}}/valid-circonus"
       },
       "Body": {
         "fields": {
@@ -245,7 +252,7 @@ var _datasetCoreV1Service_expectedJson = []byte(`{
     {
       "TypeURL": "type.googleapis.com/k8s.io.api.core.v1.ServiceSpec",
       "Metadata": {
-        "name": "kube-dns",
+        "name": "{{.Namespace}}/kube-dns",
         "annotations": {
           "kubectl.kubernetes.io/last-applied-configuration": "{\"apiVersion\":\"v1\",\"kind\":\"Service\",\"metadata\":{\"annotations\":{},\"labels\":{\"addonmanager.kubernetes.io/mode\":\"Reconcile\",\"k8s-app\":\"kube-dns\",\"kubernetes.io/cluster-service\":\"true\",\"kubernetes.io/name\":\"KubeDNS\"},\"name\":\"kube-dns\",\"namespace\":\"kube-system\"},\"spec\":{\"clusterIP\":\"10.43.240.10\",\"ports\":[{\"name\":\"dns\",\"port\":53,\"protocol\":\"UDP\"},{\"name\":\"dns-tcp\",\"port\":53,\"protocol\":\"TCP\"}],\"selector\":{\"k8s-app\":\"kube-dns\"}}}\n"
         },
@@ -510,9 +517,7 @@ var _datasetExtensionsV1beta1Ingress_merge_0_expectedJson = []byte(`{
             "match": [
               {
                 "uri": {
-                  "MatchType": {
-                    "Exact": "/bar"
-                  }
+                  "exact": "/bar"
                 }
               }
             ],
@@ -521,9 +526,7 @@ var _datasetExtensionsV1beta1Ingress_merge_0_expectedJson = []byte(`{
                 "destination": {
                   "host": "service2.{{.Namespace}}.svc.cluster.local",
                   "port": {
-                    "Port": {
-                      "Number": 2400
-                    }
+                    "number": 2400
                   }
                 },
                 "weight": 100
@@ -534,9 +537,7 @@ var _datasetExtensionsV1beta1Ingress_merge_0_expectedJson = []byte(`{
             "match": [
               {
                 "uri": {
-                  "MatchType": {
-                    "Exact": "/foo"
-                  }
+                  "exact": "/foo"
                 }
               }
             ],
@@ -545,9 +546,7 @@ var _datasetExtensionsV1beta1Ingress_merge_0_expectedJson = []byte(`{
                 "destination": {
                   "host": "service1.{{.Namespace}}.svc.cluster.local",
                   "port": {
-                    "Port": {
-                      "Number": 4200
-                    }
+                    "number": 4200
                   }
                 },
                 "weight": 100
@@ -715,9 +714,7 @@ var _datasetExtensionsV1beta1Ingress_merge_1_expectedJson = []byte(`{
             "match": [
               {
                 "uri": {
-                  "MatchType": {
-                    "Exact": "/bar"
-                  }
+                  "exact": "/bar"
                 }
               }
             ],
@@ -726,9 +723,7 @@ var _datasetExtensionsV1beta1Ingress_merge_1_expectedJson = []byte(`{
                 "destination": {
                   "host": "service5.{{.Namespace}}.svc.cluster.local",
                   "port": {
-                    "Port": {
-                      "Number": 5000
-                    }
+                    "number": 5000
                   }
                 },
                 "weight": 100
@@ -739,9 +734,7 @@ var _datasetExtensionsV1beta1Ingress_merge_1_expectedJson = []byte(`{
             "match": [
               {
                 "uri": {
-                  "MatchType": {
-                    "Exact": "/foo"
-                  }
+                  "exact": "/foo"
                 }
               }
             ],
@@ -750,9 +743,7 @@ var _datasetExtensionsV1beta1Ingress_merge_1_expectedJson = []byte(`{
                 "destination": {
                   "host": "service1.{{.Namespace}}.svc.cluster.local",
                   "port": {
-                    "Port": {
-                      "Number": 4200
-                    }
+                    "number": 4200
                   }
                 },
                 "weight": 100
@@ -778,6 +769,170 @@ func datasetExtensionsV1beta1Ingress_merge_1_expectedJson() (*asset, error) {
 	}
 
 	info := bindataFileInfo{name: "dataset/extensions/v1beta1/ingress_merge_1_expected.json", size: 0, mode: os.FileMode(0), modTime: time.Unix(0, 0)}
+	a := &asset{bytes: bytes, info: info}
+	return a, nil
+}
+
+var _datasetExtensionsV1beta1Ingress_multihostYaml = []byte(`apiVersion: extensions/v1beta1
+kind: Ingress
+metadata:
+  name: echo
+  annotations:
+    kubernetes.io/ingress.class: cls
+spec:
+  rules:
+  - host: echo1.example.com
+    http:
+      paths:
+      - backend:
+          serviceName: echo1
+          servicePort: 80
+  - host: echo2.example.com
+    http:
+      paths:
+      - backend:
+          serviceName: echo2
+          servicePort: 80`)
+
+func datasetExtensionsV1beta1Ingress_multihostYamlBytes() ([]byte, error) {
+	return _datasetExtensionsV1beta1Ingress_multihostYaml, nil
+}
+
+func datasetExtensionsV1beta1Ingress_multihostYaml() (*asset, error) {
+	bytes, err := datasetExtensionsV1beta1Ingress_multihostYamlBytes()
+	if err != nil {
+		return nil, err
+	}
+
+	info := bindataFileInfo{name: "dataset/extensions/v1beta1/ingress_multihost.yaml", size: 0, mode: os.FileMode(0), modTime: time.Unix(0, 0)}
+	a := &asset{bytes: bytes, info: info}
+	return a, nil
+}
+
+var _datasetExtensionsV1beta1Ingress_multihost_expectedJson = []byte(`{
+    "istio/networking/v1alpha3/gateways": [
+        {
+            "Metadata": {
+                "name": "istio-system/echo-istio-autogenerated-k8s-ingress"
+            },
+            "Body": {
+                "selector": {
+                    "istio": "ingress"
+                },
+                "servers": [
+                    {
+                        "hosts": [
+                            "*"
+                        ],
+                        "port": {
+                            "name": "http-80-i-echo-{{.Namespace}}",
+                            "number": 80,
+                            "protocol": "HTTP"
+                        }
+                    }
+                ]
+            },
+            "TypeURL": "type.googleapis.com/istio.networking.v1alpha3.Gateway"
+        }
+    ],
+    "istio/networking/v1alpha3/virtualservices": [
+        {
+            "Metadata": {
+                "name": "istio-system/echo1-example-com-echo-istio-autogenerated-k8s-ingress"
+            },
+            "Body": {
+                "gateways": [
+                    "istio-autogenerated-k8s-ingress"
+                ],
+                "hosts": [
+                    "echo1.example.com"
+                ],
+                "http": [
+                    {
+                        "match": [
+                            {}
+                        ],
+                        "route": [
+                            {
+                                "destination": {
+                                    "host": "echo1.{{.Namespace}}.svc.cluster.local",
+                                    "port": {
+                                        "number": 80
+                                    }
+                                },
+                                "weight": 100
+                            }
+                        ]
+                    }
+                ]
+            },
+            "TypeURL": "type.googleapis.com/istio.networking.v1alpha3.VirtualService"
+        },
+        {
+            "Metadata": {
+                "name": "istio-system/echo2-example-com-echo-istio-autogenerated-k8s-ingress"
+            },
+            "Body": {
+                "gateways": [
+                    "istio-autogenerated-k8s-ingress"
+                ],
+                "hosts": [
+                    "echo2.example.com"
+                ],
+                "http": [
+                    {
+                        "match": [
+                            {}
+                        ],
+                        "route": [
+                            {
+                                "destination": {
+                                    "host": "echo2.{{.Namespace}}.svc.cluster.local",
+                                    "port": {
+                                        "number": 80
+                                    }
+                                },
+                                "weight": 100
+                            }
+                        ]
+                    }
+                ]
+            },
+            "TypeURL": "type.googleapis.com/istio.networking.v1alpha3.VirtualService"
+        }
+    ]
+}`)
+
+func datasetExtensionsV1beta1Ingress_multihost_expectedJsonBytes() ([]byte, error) {
+	return _datasetExtensionsV1beta1Ingress_multihost_expectedJson, nil
+}
+
+func datasetExtensionsV1beta1Ingress_multihost_expectedJson() (*asset, error) {
+	bytes, err := datasetExtensionsV1beta1Ingress_multihost_expectedJsonBytes()
+	if err != nil {
+		return nil, err
+	}
+
+	info := bindataFileInfo{name: "dataset/extensions/v1beta1/ingress_multihost_expected.json", size: 0, mode: os.FileMode(0), modTime: time.Unix(0, 0)}
+	a := &asset{bytes: bytes, info: info}
+	return a, nil
+}
+
+var _datasetExtensionsV1beta1Ingress_multihost_meshconfigYaml = []byte(`ingressClass: cls
+ingressControllerMode: STRICT
+`)
+
+func datasetExtensionsV1beta1Ingress_multihost_meshconfigYamlBytes() ([]byte, error) {
+	return _datasetExtensionsV1beta1Ingress_multihost_meshconfigYaml, nil
+}
+
+func datasetExtensionsV1beta1Ingress_multihost_meshconfigYaml() (*asset, error) {
+	bytes, err := datasetExtensionsV1beta1Ingress_multihost_meshconfigYamlBytes()
+	if err != nil {
+		return nil, err
+	}
+
+	info := bindataFileInfo{name: "dataset/extensions/v1beta1/ingress_multihost_meshconfig.yaml", size: 0, mode: os.FileMode(0), modTime: time.Unix(0, 0)}
 	a := &asset{bytes: bytes, info: info}
 	return a, nil
 }
@@ -811,13 +966,51 @@ var _datasetMeshIstioIoV1alpha1Meshconfig_expectedJson = []byte(`{
                 "connect_timeout": {
                     "seconds": 1
                 },
+                "default_config": {
+                  "binary_path": "/usr/local/bin/envoy",
+                  "config_path": "/etc/istio/proxy",
+                  "connect_timeout": {
+                    "seconds": 1
+                  },
+                  "discovery_address": "istio-pilot:15010",
+                  "drain_duration": {
+                    "seconds": 45
+                  },
+                  "envoy_access_log_service": {},
+                  "envoy_metrics_service": {},
+                  "parent_shutdown_duration": {
+                    "seconds": 60
+                  },
+                  "proxy_admin_port": 15000,
+                  "service_cluster": "istio-proxy",
+                  "stat_name_length": 189
+                },
+                "default_destination_rule_export_to": [
+                  "*"
+                ],
+                "default_service_export_to": [
+                  "*"
+                ],
+                "default_virtual_service_export_to": [
+                  "*"
+                ],
+                "disable_policy_checks": true,
+                "dns_refresh_rate": {
+                  "seconds": 5
+                },
+                "enable_auto_mtls": {},
                 "enable_tracing": true,
                 "ingress_class": "istio",
                 "ingress_controller_mode": 2,
+                "ingress_service": "istio-ingressgateway",
                 "outbound_traffic_policy": {
                     "mode": 1
                 },
-                "proxy_listen_port": 15001
+                "protocol_detection_timeout": {
+                  "nanos": 100000000
+                },
+                "proxy_listen_port": 15001,
+                "root_namespace": "istio-system"
             }
         }
     ]
@@ -874,7 +1067,7 @@ var _datasetNetworkingIstioIoV1alpha3Destinationrule_expectedJson = []byte(`{
     {
       "TypeURL": "type.googleapis.com/istio.networking.v1alpha3.DestinationRule",
       "Metadata": {
-        "name": "tcp-echo-destination"
+        "name": "{{.Namespace}}/tcp-echo-destination"
       },
       "Body": {
         "host": "tcp-echo",
@@ -949,7 +1142,7 @@ var _datasetNetworkingIstioIoV1alpha3Gateway_expectedJson = []byte(`{
     {
       "TypeURL": "type.googleapis.com/istio.networking.v1alpha3.Gateway",
       "Metadata": {
-        "name": "helloworld-gateway"
+        "name": "{{.Namespace}}/helloworld-gateway"
       },
       "Body": {
         "selector": {
@@ -2061,6 +2254,180 @@ func datasetNetworkingIstioIoV1alpha3SyntheticServiceentry_expectedJson() (*asse
 	return a, nil
 }
 
+var _datasetNetworkingIstioIoV1alpha3VirtualserviceYaml = []byte(`apiVersion: networking.istio.io/v1alpha3
+kind: VirtualService
+metadata:
+  name: valid-virtual-service
+spec:
+  hosts:
+    - c
+  http:
+    - route:
+      - destination:
+          host: c
+          subset: v1
+        weight: 75
+      - destination:
+          host: c
+          subset: v2
+        weight: 25
+`)
+
+func datasetNetworkingIstioIoV1alpha3VirtualserviceYamlBytes() ([]byte, error) {
+	return _datasetNetworkingIstioIoV1alpha3VirtualserviceYaml, nil
+}
+
+func datasetNetworkingIstioIoV1alpha3VirtualserviceYaml() (*asset, error) {
+	bytes, err := datasetNetworkingIstioIoV1alpha3VirtualserviceYamlBytes()
+	if err != nil {
+		return nil, err
+	}
+
+	info := bindataFileInfo{name: "dataset/networking.istio.io/v1alpha3/virtualService.yaml", size: 0, mode: os.FileMode(0), modTime: time.Unix(0, 0)}
+	a := &asset{bytes: bytes, info: info}
+	return a, nil
+}
+
+var _datasetNetworkingIstioIoV1alpha3VirtualservicewithunsupportedYaml = []byte(`apiVersion: networking.istio.io/v1alpha3
+kind: VirtualService
+metadata:
+  name: valid-virtual-service
+spec:
+  hosts:
+    - c
+  http:
+    - route:
+      - destination:
+          host: c
+          subset: v1
+          unsupportedExtraParam: true
+        weight: 75
+      - destination:
+          host: c
+          subset: v2
+        weight: 25
+        unsupportedExtraParam: true
+`)
+
+func datasetNetworkingIstioIoV1alpha3VirtualservicewithunsupportedYamlBytes() ([]byte, error) {
+	return _datasetNetworkingIstioIoV1alpha3VirtualservicewithunsupportedYaml, nil
+}
+
+func datasetNetworkingIstioIoV1alpha3VirtualservicewithunsupportedYaml() (*asset, error) {
+	bytes, err := datasetNetworkingIstioIoV1alpha3VirtualservicewithunsupportedYamlBytes()
+	if err != nil {
+		return nil, err
+	}
+
+	info := bindataFileInfo{name: "dataset/networking.istio.io/v1alpha3/virtualServiceWithUnsupported.yaml", size: 0, mode: os.FileMode(0), modTime: time.Unix(0, 0)}
+	a := &asset{bytes: bytes, info: info}
+	return a, nil
+}
+
+var _datasetNetworkingIstioIoV1alpha3Virtualservicewithunsupported_expectedJson = []byte(`{
+  "istio/networking/v1alpha3/virtualservices": [
+    {
+      "Metadata": {
+        "name": "{{.Namespace}}/valid-virtual-service"
+      },
+      "Body": {
+        "hosts": [
+          "c"
+        ],
+        "http": [
+          {
+            "route": [
+              {
+                "destination": {
+                  "host": "c",
+                  "subset": "v1"
+                },
+                "weight": 75
+              },
+              {
+                "destination": {
+                  "host": "c",
+                  "subset": "v2"
+                },
+                "weight": 25
+              }
+            ]
+          }
+        ]
+      },
+      "TypeURL": "type.googleapis.com/istio.networking.v1alpha3.VirtualService"
+    }
+  ]
+}
+`)
+
+func datasetNetworkingIstioIoV1alpha3Virtualservicewithunsupported_expectedJsonBytes() ([]byte, error) {
+	return _datasetNetworkingIstioIoV1alpha3Virtualservicewithunsupported_expectedJson, nil
+}
+
+func datasetNetworkingIstioIoV1alpha3Virtualservicewithunsupported_expectedJson() (*asset, error) {
+	bytes, err := datasetNetworkingIstioIoV1alpha3Virtualservicewithunsupported_expectedJsonBytes()
+	if err != nil {
+		return nil, err
+	}
+
+	info := bindataFileInfo{name: "dataset/networking.istio.io/v1alpha3/virtualServiceWithUnsupported_expected.json", size: 0, mode: os.FileMode(0), modTime: time.Unix(0, 0)}
+	a := &asset{bytes: bytes, info: info}
+	return a, nil
+}
+
+var _datasetNetworkingIstioIoV1alpha3Virtualservice_expectedJson = []byte(`{
+  "istio/networking/v1alpha3/virtualservices": [
+    {
+      "Metadata": {
+        "name": "{{.Namespace}}/valid-virtual-service"
+      },
+      "Body": {
+        "hosts": [
+          "c"
+        ],
+        "http": [
+          {
+            "route": [
+              {
+                "destination": {
+                  "host": "c",
+                  "subset": "v1"
+                },
+                "weight": 75
+              },
+              {
+                "destination": {
+                  "host": "c",
+                  "subset": "v2"
+                },
+                "weight": 25
+              }
+            ]
+          }
+        ]
+      },
+      "TypeURL": "type.googleapis.com/istio.networking.v1alpha3.VirtualService"
+    }
+  ]
+}
+`)
+
+func datasetNetworkingIstioIoV1alpha3Virtualservice_expectedJsonBytes() ([]byte, error) {
+	return _datasetNetworkingIstioIoV1alpha3Virtualservice_expectedJson, nil
+}
+
+func datasetNetworkingIstioIoV1alpha3Virtualservice_expectedJson() (*asset, error) {
+	bytes, err := datasetNetworkingIstioIoV1alpha3Virtualservice_expectedJsonBytes()
+	if err != nil {
+		return nil, err
+	}
+
+	info := bindataFileInfo{name: "dataset/networking.istio.io/v1alpha3/virtualService_expected.json", size: 0, mode: os.FileMode(0), modTime: time.Unix(0, 0)}
+	a := &asset{bytes: bytes, info: info}
+	return a, nil
+}
+
 // Asset loads and returns the asset for the given name.
 // It returns an error if the asset could not be found or
 // could not be loaded.
@@ -2127,6 +2494,9 @@ var _bindata = map[string]func() (*asset, error){
 	"dataset/extensions/v1beta1/ingress_merge_0_meshconfig.yaml": datasetExtensionsV1beta1Ingress_merge_0_meshconfigYaml,
 	"dataset/extensions/v1beta1/ingress_merge_1.yaml": datasetExtensionsV1beta1Ingress_merge_1Yaml,
 	"dataset/extensions/v1beta1/ingress_merge_1_expected.json": datasetExtensionsV1beta1Ingress_merge_1_expectedJson,
+	"dataset/extensions/v1beta1/ingress_multihost.yaml": datasetExtensionsV1beta1Ingress_multihostYaml,
+	"dataset/extensions/v1beta1/ingress_multihost_expected.json": datasetExtensionsV1beta1Ingress_multihost_expectedJson,
+	"dataset/extensions/v1beta1/ingress_multihost_meshconfig.yaml": datasetExtensionsV1beta1Ingress_multihost_meshconfigYaml,
 	"dataset/mesh.istio.io/v1alpha1/meshconfig.yaml": datasetMeshIstioIoV1alpha1MeshconfigYaml,
 	"dataset/mesh.istio.io/v1alpha1/meshconfig_expected.json": datasetMeshIstioIoV1alpha1Meshconfig_expectedJson,
 	"dataset/networking.istio.io/v1alpha3/destinationRule.yaml": datasetNetworkingIstioIoV1alpha3DestinationruleYaml,
@@ -2135,6 +2505,10 @@ var _bindata = map[string]func() (*asset, error){
 	"dataset/networking.istio.io/v1alpha3/gateway_expected.json": datasetNetworkingIstioIoV1alpha3Gateway_expectedJson,
 	"dataset/networking.istio.io/v1alpha3/synthetic/serviceEntry.yaml": datasetNetworkingIstioIoV1alpha3SyntheticServiceentryYaml,
 	"dataset/networking.istio.io/v1alpha3/synthetic/serviceEntry_expected.json": datasetNetworkingIstioIoV1alpha3SyntheticServiceentry_expectedJson,
+	"dataset/networking.istio.io/v1alpha3/virtualService.yaml": datasetNetworkingIstioIoV1alpha3VirtualserviceYaml,
+	"dataset/networking.istio.io/v1alpha3/virtualServiceWithUnsupported.yaml": datasetNetworkingIstioIoV1alpha3VirtualservicewithunsupportedYaml,
+	"dataset/networking.istio.io/v1alpha3/virtualServiceWithUnsupported_expected.json": datasetNetworkingIstioIoV1alpha3Virtualservicewithunsupported_expectedJson,
+	"dataset/networking.istio.io/v1alpha3/virtualService_expected.json": datasetNetworkingIstioIoV1alpha3Virtualservice_expectedJson,
 }
 
 // AssetDir returns the file names below a certain
@@ -2202,6 +2576,9 @@ var _bintree = &bintree{nil, map[string]*bintree{
 				"ingress_merge_0_meshconfig.yaml": &bintree{datasetExtensionsV1beta1Ingress_merge_0_meshconfigYaml, map[string]*bintree{}},
 				"ingress_merge_1.yaml": &bintree{datasetExtensionsV1beta1Ingress_merge_1Yaml, map[string]*bintree{}},
 				"ingress_merge_1_expected.json": &bintree{datasetExtensionsV1beta1Ingress_merge_1_expectedJson, map[string]*bintree{}},
+				"ingress_multihost.yaml": &bintree{datasetExtensionsV1beta1Ingress_multihostYaml, map[string]*bintree{}},
+				"ingress_multihost_expected.json": &bintree{datasetExtensionsV1beta1Ingress_multihost_expectedJson, map[string]*bintree{}},
+				"ingress_multihost_meshconfig.yaml": &bintree{datasetExtensionsV1beta1Ingress_multihost_meshconfigYaml, map[string]*bintree{}},
 			}},
 		}},
 		"mesh.istio.io": &bintree{nil, map[string]*bintree{
@@ -2220,6 +2597,10 @@ var _bintree = &bintree{nil, map[string]*bintree{
 					"serviceEntry.yaml": &bintree{datasetNetworkingIstioIoV1alpha3SyntheticServiceentryYaml, map[string]*bintree{}},
 					"serviceEntry_expected.json": &bintree{datasetNetworkingIstioIoV1alpha3SyntheticServiceentry_expectedJson, map[string]*bintree{}},
 				}},
+				"virtualService.yaml": &bintree{datasetNetworkingIstioIoV1alpha3VirtualserviceYaml, map[string]*bintree{}},
+				"virtualServiceWithUnsupported.yaml": &bintree{datasetNetworkingIstioIoV1alpha3VirtualservicewithunsupportedYaml, map[string]*bintree{}},
+				"virtualServiceWithUnsupported_expected.json": &bintree{datasetNetworkingIstioIoV1alpha3Virtualservicewithunsupported_expectedJson, map[string]*bintree{}},
+				"virtualService_expected.json": &bintree{datasetNetworkingIstioIoV1alpha3Virtualservice_expectedJson, map[string]*bintree{}},
 			}},
 		}},
 	}},

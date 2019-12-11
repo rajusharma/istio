@@ -15,8 +15,10 @@
 package sds
 
 import (
+	"context"
 	"fmt"
 	"net"
+	"net/http"
 	"os"
 	"time"
 
@@ -29,11 +31,18 @@ import (
 	"istio.io/pkg/version"
 )
 
-const maxStreams = 100000
-const maxRetryTimes = 5
+const (
+	// base HTTP route for debug endpoints
+	debugBase     = "/debug"
+	maxStreams    = 100000
+	maxRetryTimes = 5
+)
 
 // Options provides all of the configuration parameters for secret discovery service.
 type Options struct {
+	// PluginNames is plugins' name for certain authentication provider.
+	PluginNames []string
+
 	// WorkloadUDSPath is the unix domain socket through which SDS server communicates with workload proxies.
 	WorkloadUDSPath string
 
@@ -57,9 +66,6 @@ type Options struct {
 	// https://github.com/spiffe/spiffe/blob/master/standards/SPIFFE-ID.md#21-trust-domain
 	TrustDomain string
 
-	// PluginNames is plugins' name for certain authentication provider.
-	PluginNames []string
-
 	// The Vault CA address.
 	VaultAddress string
 
@@ -75,16 +81,27 @@ type Options struct {
 	// The Vault TLS root certificate.
 	VaultTLSRootCert string
 
+	// GrpcServer is an already configured (shared) grpc server. If set, the agent will just register on the server.
+	GrpcServer *grpc.Server
+
+	// Recycle job running interval (to clean up staled sds client connections).
+	RecycleInterval time.Duration
+
+	// Debug server port from which node_agent serves SDS configuration dumps
+	DebugPort int
+
 	// EnableWorkloadSDS indicates whether node agent works as SDS server for workload proxies.
 	EnableWorkloadSDS bool
 
 	// EnableIngressGatewaySDS indicates whether node agent works as ingress gateway agent.
 	EnableIngressGatewaySDS bool
+
 	// AlwaysValidTokenFlag is set to true for if token used is always valid(ex, normal k8s JWT)
 	AlwaysValidTokenFlag bool
 
-	// Recycle job running interval (to clean up staled sds client connections).
-	RecycleInterval time.Duration
+	// UseLocalJWT is set when the sds server should use its own local JWT, and not expect one
+	// from the UDS caller. Used when it runs in the same container with Envoy.
+	UseLocalJWT bool
 }
 
 // Server is the gPRC server that exposes SDS through UDS.
@@ -97,13 +114,14 @@ type Server struct {
 
 	grpcWorkloadServer *grpc.Server
 	grpcGatewayServer  *grpc.Server
+	debugServer        *http.Server
 }
 
 // NewServer creates and starts the Grpc server for SDS.
 func NewServer(options Options, workloadSecretCache, gatewaySecretCache cache.SecretManager) (*Server, error) {
 	s := &Server{
-		workloadSds: newSDSService(workloadSecretCache, false, options.RecycleInterval),
-		gatewaySds:  newSDSService(gatewaySecretCache, true, options.RecycleInterval),
+		workloadSds: newSDSService(workloadSecretCache, false, options.UseLocalJWT, options.RecycleInterval),
+		gatewaySds:  newSDSService(gatewaySecretCache, true, options.UseLocalJWT, options.RecycleInterval),
 	}
 	if options.EnableWorkloadSDS {
 		if err := s.initWorkloadSdsService(&options); err != nil {
@@ -123,10 +141,13 @@ func NewServer(options Options, workloadSecretCache, gatewaySecretCache cache.Se
 	}
 	version.Info.RecordComponentBuildTag("citadel_agent")
 
+	if options.DebugPort > 0 {
+		s.initDebugServer(options.DebugPort)
+	}
 	return s, nil
 }
 
-// Stop closes the gRPC server.
+// Stop closes the gRPC server and debug server.
 func (s *Server) Stop() {
 	if s == nil {
 		return
@@ -147,6 +168,12 @@ func (s *Server) Stop() {
 		s.gatewaySds.Stop()
 		s.grpcGatewayServer.Stop()
 	}
+
+	if s.debugServer != nil {
+		if err := s.debugServer.Shutdown(context.TODO()); err != nil {
+			sdsServiceLog.Error("failed to shut down debug server")
+		}
+	}
 }
 
 // NewPlugins returns a slice of default Plugins.
@@ -163,7 +190,44 @@ func NewPlugins(in []string) []plugin.Plugin {
 	return plugins
 }
 
+func (s *Server) initDebugServer(port int) {
+	mux := http.NewServeMux()
+	mux.HandleFunc(fmt.Sprintf("%s/sds/workload", debugBase), s.workloadSds.debugHTTPHandler)
+	mux.HandleFunc(fmt.Sprintf("%s/sds/gateway", debugBase), s.gatewaySds.debugHTTPHandler)
+	s.debugServer = &http.Server{
+		Addr:    fmt.Sprintf("127.0.0.1:%d", port),
+		Handler: mux,
+	}
+
+	go func() {
+		err := s.debugServer.ListenAndServe()
+		sdsServiceLog.Errorf("debug server failure: %s", err)
+	}()
+}
+
+func (s *sdsservice) debugHTTPHandler(w http.ResponseWriter, req *http.Request) {
+	w.Header().Add("Content-Type", "application/json")
+
+	workloadJSON, err := s.DebugInfo()
+	if err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		failureMessage := fmt.Sprintf("debug endpoint failure: %s", err)
+		if _, err := w.Write([]byte(failureMessage)); err != nil {
+			sdsServiceLog.Errorf("debug endpoint failed to write error response: %s", err)
+		}
+		return
+	}
+	if _, err := w.Write([]byte(workloadJSON)); err != nil {
+		sdsServiceLog.Errorf("debug endpoint failed to write response: %s", err)
+	}
+}
+
 func (s *Server) initWorkloadSdsService(options *Options) error { //nolint: unparam
+	if options.GrpcServer != nil {
+		s.grpcWorkloadServer = options.GrpcServer
+		s.workloadSds.register(s.grpcWorkloadServer)
+		return nil
+	}
 	s.grpcWorkloadServer = grpc.NewServer(s.grpcServerOptions(options)...)
 	s.workloadSds.register(s.grpcWorkloadServer)
 
@@ -176,14 +240,24 @@ func (s *Server) initWorkloadSdsService(options *Options) error { //nolint: unpa
 	go func() {
 		sdsServiceLog.Info("Start SDS grpc server")
 		waitTime := time.Second
+
 		for i := 0; i < maxRetryTimes; i++ {
-			// Retry if Serve() fails
-			if err = s.grpcWorkloadServer.Serve(s.grpcWorkloadListener); err != nil {
-				sdsServiceLog.Errorf("SDS grpc server for workload proxies failed to start: %v", err)
+			serverOk := true
+			setUpUdsOK := true
+			if s.grpcWorkloadListener != nil {
+				if err = s.grpcWorkloadServer.Serve(s.grpcWorkloadListener); err != nil {
+					sdsServiceLog.Errorf("SDS grpc server for workload proxies failed to start: %v", err)
+					serverOk = false
+				}
 			}
-			s.grpcWorkloadListener, err = setUpUds(options.WorkloadUDSPath)
-			if err != nil {
-				sdsServiceLog.Errorf("SDS grpc server for workload proxies failed to set up UDS: %v", err)
+			if s.grpcWorkloadListener == nil {
+				if s.grpcWorkloadListener, err = setUpUds(options.WorkloadUDSPath); err != nil {
+					sdsServiceLog.Errorf("SDS grpc server for workload proxies failed to set up UDS: %v", err)
+					setUpUdsOK = false
+				}
+			}
+			if serverOk && setUpUdsOK {
+				break
 			}
 			time.Sleep(waitTime)
 			waitTime *= 2
@@ -207,14 +281,24 @@ func (s *Server) initGatewaySdsService(options *Options) error {
 	go func() {
 		sdsServiceLog.Info("Start SDS grpc server for ingress gateway proxy")
 		waitTime := time.Second
+
 		for i := 0; i < maxRetryTimes; i++ {
-			// Retry if Serve() fails
-			if err = s.grpcGatewayServer.Serve(s.grpcGatewayListener); err != nil {
-				sdsServiceLog.Errorf("SDS grpc server for ingress gateway proxy failed to start: %v", err)
+			serverOk := true
+			setUpUdsOK := true
+			if s.grpcGatewayListener != nil {
+				if err = s.grpcGatewayServer.Serve(s.grpcGatewayListener); err != nil {
+					sdsServiceLog.Errorf("SDS grpc server for ingress gateway proxy failed to start: %v", err)
+					serverOk = false
+				}
 			}
-			s.grpcGatewayListener, err = setUpUds(options.IngressGatewayUDSPath)
-			if err != nil {
-				sdsServiceLog.Errorf("SDS grpc server for ingress gateway proxy failed to set up UDS: %v", err)
+			if s.grpcGatewayListener == nil {
+				if s.grpcGatewayListener, err = setUpUds(options.IngressGatewayUDSPath); err != nil {
+					sdsServiceLog.Errorf("SDS grpc server for ingress gateway proxy failed to set up UDS: %v", err)
+					setUpUdsOK = false
+				}
+			}
+			if serverOk && setUpUdsOK {
+				break
 			}
 			time.Sleep(waitTime)
 			waitTime *= 2

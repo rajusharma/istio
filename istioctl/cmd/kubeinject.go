@@ -22,18 +22,19 @@ import (
 	"os"
 
 	"github.com/ghodss/yaml"
+	"github.com/hashicorp/go-multierror"
 	"github.com/spf13/cobra"
-	"go.uber.org/multierr"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/client-go/kubernetes"
 
 	meshconfig "istio.io/api/mesh/v1alpha1"
-	"istio.io/istio/pilot/cmd"
-	"istio.io/istio/pilot/pkg/kube/inject"
-	"istio.io/istio/pilot/pkg/model"
-	"istio.io/istio/pkg/kube"
 	"istio.io/pkg/log"
 	"istio.io/pkg/version"
+
+	"istio.io/istio/pkg/config/mesh"
+	"istio.io/istio/pkg/kube"
+	"istio.io/istio/pkg/kube/inject"
+
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/kubernetes"
 )
 
 const (
@@ -51,29 +52,29 @@ func createInterface(kubeconfig string) (kubernetes.Interface, error) {
 	return kubernetes.NewForConfig(restConfig)
 }
 
-func getMeshConfigFromConfigMap(kubeconfig string) (*meshconfig.MeshConfig, error) {
+func getMeshConfigFromConfigMap(kubeconfig, command string) (*meshconfig.MeshConfig, error) {
 	client, err := createInterface(kubeconfig)
 	if err != nil {
 		return nil, err
 	}
 
-	config, err := client.CoreV1().ConfigMaps(istioNamespace).Get(meshConfigMapName, metav1.GetOptions{})
+	meshConfigMap, err := client.CoreV1().ConfigMaps(istioNamespace).Get(meshConfigMapName, metav1.GetOptions{})
 	if err != nil {
-		return nil, fmt.Errorf("could not read valid configmap %q from namespace  %q: %v - "+
-			"Use --meshConfigFile or re-run kube-inject with `-i <istioSystemNamespace> and ensure valid MeshConfig exists",
+		return nil, fmt.Errorf("could not read valid configmap %q from namespace %q: %v - "+
+			"Use --meshConfigFile or re-run "+command+" with `-i <istioSystemNamespace> and ensure valid MeshConfig exists",
 			meshConfigMapName, istioNamespace, err)
 	}
 	// values in the data are strings, while proto might use a
 	// different data type.  therefore, we have to get a value by a
 	// key
-	configYaml, exists := config.Data[configMapKey]
+	configYaml, exists := meshConfigMap.Data[configMapKey]
 	if !exists {
 		return nil, fmt.Errorf("missing configuration map key %q", configMapKey)
 	}
-	cfg, err := model.ApplyMeshConfigDefaults(configYaml)
+	cfg, err := mesh.ApplyMeshConfigDefaults(configYaml)
 	if err != nil {
-		err = multierr.Append(fmt.Errorf("istioctl version %s cannot parse mesh config.  Install istioctl from the latest Istio release",
-			version.Info.Version), err)
+		err = multierror.Append(err, fmt.Errorf("istioctl version %s cannot parse mesh config.  Install istioctl from the latest Istio release",
+			version.Info.Version))
 	}
 	return cfg, err
 }
@@ -85,14 +86,14 @@ func getValuesFromConfigMap(kubeconfig string) (string, error) {
 		return "", err
 	}
 
-	config, err := client.CoreV1().ConfigMaps(istioNamespace).Get(injectConfigMapName, metav1.GetOptions{})
+	meshConfigMap, err := client.CoreV1().ConfigMaps(istioNamespace).Get(injectConfigMapName, metav1.GetOptions{})
 	if err != nil {
 		return "", fmt.Errorf("could not find valid configmap %q from namespace  %q: %v - "+
 			"Use --injectConfigFile or re-run kube-inject with `-i <istioSystemNamespace> and ensure istio-inject configmap exists",
 			injectConfigMapName, istioNamespace, err)
 	}
 
-	valuesData, exists := config.Data[valuesConfigMapKey]
+	valuesData, exists := meshConfigMap.Data[valuesConfigMapKey]
 	if !exists {
 		return "", fmt.Errorf("missing configuration map key %q in %q",
 			valuesConfigMapKey, injectConfigMapName)
@@ -107,7 +108,7 @@ func getInjectConfigFromConfigMap(kubeconfig string) (string, error) {
 		return "", err
 	}
 
-	config, err := client.CoreV1().ConfigMaps(istioNamespace).Get(injectConfigMapName, metav1.GetOptions{})
+	meshConfigMap, err := client.CoreV1().ConfigMaps(istioNamespace).Get(injectConfigMapName, metav1.GetOptions{})
 	if err != nil {
 		return "", fmt.Errorf("could not find valid configmap %q from namespace  %q: %v - "+
 			"Use --injectConfigFile or re-run kube-inject with `-i <istioSystemNamespace> and ensure istio-inject configmap exists",
@@ -116,7 +117,7 @@ func getInjectConfigFromConfigMap(kubeconfig string) (string, error) {
 	// values in the data are strings, while proto might use a
 	// different data type.  therefore, we have to get a value by a
 	// key
-	injectData, exists := config.Data[injectConfigMapKey]
+	injectData, exists := meshConfigMap.Data[injectConfigMapKey]
 	if !exists {
 		return "", fmt.Errorf("missing configuration map key %q in %q",
 			injectConfigMapKey, injectConfigMapName)
@@ -133,13 +134,13 @@ func getInjectConfigFromConfigMap(kubeconfig string) (string, error) {
 func validateFlags() error {
 	var err error
 	if inFilename != "" && emitTemplate {
-		err = multierr.Append(err, errors.New("--filename and --emitTemplate are mutually exclusive"))
+		err = multierror.Append(err, errors.New("--filename and --emitTemplate are mutually exclusive"))
 	}
 	if inFilename == "" && !emitTemplate {
-		err = multierr.Append(err, errors.New("filename not specified (see --filename or -f)"))
+		err = multierror.Append(err, errors.New("filename not specified (see --filename or -f)"))
 	}
 	if meshConfigFile == "" && meshConfigMapName == "" {
-		err = multierr.Append(err, errors.New("--meshConfigFile or --meshConfigMapName must be set"))
+		err = multierror.Append(err, errors.New("--meshConfigFile or --meshConfigMapName must be set"))
 	}
 	return err
 }
@@ -254,11 +255,11 @@ istioctl kube-inject -f samples/bookinfo/platform/kube/bookinfo.yaml \
 
 			var meshConfig *meshconfig.MeshConfig
 			if meshConfigFile != "" {
-				if meshConfig, err = cmd.ReadMeshConfig(meshConfigFile); err != nil {
+				if meshConfig, err = mesh.ReadMeshConfig(meshConfigFile); err != nil {
 					return err
 				}
 			} else {
-				if meshConfig, err = getMeshConfigFromConfigMap(kubeconfig); err != nil {
+				if meshConfig, err = getMeshConfigFromConfigMap(kubeconfig, "kube-inject"); err != nil {
 					return err
 				}
 			}
@@ -269,11 +270,11 @@ istioctl kube-inject -f samples/bookinfo/platform/kube/bookinfo.yaml \
 				if err != nil {
 					return err
 				}
-				var config inject.Config
-				if err := yaml.Unmarshal(injectionConfig, &config); err != nil {
-					return multierr.Append(fmt.Errorf("loading --injectConfigFile"), err)
+				var injectConfig inject.Config
+				if err := yaml.Unmarshal(injectionConfig, &injectConfig); err != nil {
+					return multierror.Append(err, fmt.Errorf("loading --injectConfigFile"))
 				}
-				sidecarTemplate = config.Template
+				sidecarTemplate = injectConfig.Template
 			} else if sidecarTemplate, err = getInjectConfigFromConfigMap(kubeconfig); err != nil {
 				return err
 			}
@@ -290,11 +291,11 @@ istioctl kube-inject -f samples/bookinfo/platform/kube/bookinfo.yaml \
 			}
 
 			if emitTemplate {
-				config := inject.Config{
+				cfg := inject.Config{
 					Policy:   inject.InjectionPolicyEnabled,
 					Template: sidecarTemplate,
 				}
-				out, err := yaml.Marshal(&config)
+				out, err := yaml.Marshal(&cfg)
 				if err != nil {
 					return err
 				}

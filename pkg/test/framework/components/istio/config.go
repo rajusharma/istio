@@ -54,29 +54,27 @@ const (
 
 	// DefaultCIUndeployTimeout for Istio.
 	DefaultCIUndeployTimeout = time.Second * 900
-
-	// DefaultIstioChartRepo for Istio.
-	DefaultIstioChartRepo = "https://gcsweb.istio.io/gcs/istio-prerelease/daily-build/release-1.1-latest-daily/charts/"
 )
 
 var (
 	helmValues string
 
 	settingsFromCommandline = &Config{
-		ChartRepo:          DefaultIstioChartRepo,
-		SystemNamespace:    DefaultSystemNamespace,
-		IstioNamespace:     DefaultSystemNamespace,
-		ConfigNamespace:    DefaultSystemNamespace,
-		TelemetryNamespace: DefaultSystemNamespace,
-		PolicyNamespace:    DefaultSystemNamespace,
-		IngressNamespace:   DefaultSystemNamespace,
-		EgressNamespace:    DefaultSystemNamespace,
-		DeployIstio:        true,
-		DeployTimeout:      0,
-		UndeployTimeout:    0,
-		ChartDir:           env.IstioChartDir,
-		CrdsFilesDir:       env.CrdsFilesDir,
-		ValuesFile:         E2EValuesFile,
+		SystemNamespace:                DefaultSystemNamespace,
+		IstioNamespace:                 DefaultSystemNamespace,
+		ConfigNamespace:                DefaultSystemNamespace,
+		TelemetryNamespace:             DefaultSystemNamespace,
+		PolicyNamespace:                DefaultSystemNamespace,
+		IngressNamespace:               DefaultSystemNamespace,
+		EgressNamespace:                DefaultSystemNamespace,
+		Operator:                       false,
+		DeployIstio:                    true,
+		DeployTimeout:                  0,
+		UndeployTimeout:                0,
+		ChartDir:                       env.IstioChartDir,
+		CrdsFilesDir:                   env.CrdsFilesDir,
+		ValuesFile:                     E2EValuesFile,
+		CustomSidecarInjectorNamespace: "",
 	}
 )
 
@@ -109,8 +107,6 @@ type Config struct {
 	// UndeployTimeout the timeout for undeploying Istio.
 	UndeployTimeout time.Duration
 
-	ChartRepo string
-
 	// The top-level Helm chart dir.
 	ChartDir string
 
@@ -120,26 +116,39 @@ type Config struct {
 	// The Helm values file to be used.
 	ValuesFile string
 
+	// Override values specifically for the ICP crd
+	// This is mostly required for cases where --set cannot be used
+	// If specified, Values will be ignored
+	ControlPlaneValues string
+
 	// Overrides for the Helm values file.
 	Values map[string]string
 
 	// Indicates that the test should deploy Istio into the target Kubernetes cluster before running tests.
 	DeployIstio bool
 
+	// Operator determines if we should use the operator for installation
+	Operator bool
+
 	// Do not wait for the validation webhook before completing the deployment. This is useful for
 	// doing deployments without Galley.
 	SkipWaitForValidationWebhook bool
+
+	// CustomSidecarInjectorNamespace allows injecting the sidecar from the specified namespace.
+	// if the value is "", use the default sidecar injection instead.
+	CustomSidecarInjectorNamespace string
 }
 
-// Is mtls enabled. Check in Values flag and Values file.
+// IsMtlsEnabled checks in Values flag and Values file.
 func (c *Config) IsMtlsEnabled() bool {
-	if c.Values["global.mtls.enabled"] == "true" {
+	if c.Values["global.mtls.enabled"] == "true" ||
+		c.Values["global.mtls.auto"] == "true" {
 		return true
 	}
 
 	data, err := file.AsString(filepath.Join(c.ChartDir, c.ValuesFile))
 	if err != nil {
-		return false
+		return true
 	}
 	m := make(map[interface{}]interface{})
 	err = yaml2.Unmarshal([]byte(data), &m)
@@ -151,12 +160,55 @@ func (c *Config) IsMtlsEnabled() bool {
 		case map[interface{}]interface{}:
 			switch mtlsVal := globalVal["mtls"].(type) {
 			case map[interface{}]interface{}:
-				return mtlsVal["enabled"].(bool)
+				if !mtlsVal["enabled"].(bool) && !mtlsVal["auto"].(bool) {
+					return false
+				}
 			}
 		}
 	}
 
-	return false
+	return true
+}
+
+func (c *Config) IstioControlPlane() string {
+	data := c.ControlPlaneValues
+	if c.ValuesFile != "" {
+		var err error
+		data, err = file.AsString(filepath.Join(c.ChartDir, c.ValuesFile))
+		if err != nil {
+			return ""
+		}
+	}
+	s, err := image.SettingsFromCommandLine()
+	if err != nil {
+		return ""
+	}
+
+	return fmt.Sprintf(`
+apiVersion: install.istio.io/v1alpha2
+kind: IstioControlPlane
+spec:
+  hub: %s
+  tag: %s
+  values:
+%s
+`, s.Hub, s.Tag, Indent(data, "    "))
+}
+
+// indents a block of text with an indent string
+func Indent(text, indent string) string {
+	if text[len(text)-1:] == "\n" {
+		result := ""
+		for _, j := range strings.Split(text[:len(text)-1], "\n") {
+			result += indent + j + "\n"
+		}
+		return result
+	}
+	result := ""
+	for _, j := range strings.Split(strings.TrimRight(text, "\n"), "\n") {
+		result += indent + j + "\n"
+	}
+	return result[:len(result)-1]
 }
 
 // DefaultConfig creates a new Config from defaults, environments variables, and command-line parameters.
@@ -181,7 +233,7 @@ func DefaultConfig(ctx resource.Context) (Config, error) {
 		return Config{}, err
 	}
 
-	if s.Values, err = newHelmValues(deps); err != nil {
+	if s.Values, err = newHelmValues(ctx, deps); err != nil {
 		return Config{}, err
 	}
 
@@ -223,7 +275,7 @@ func checkFileExists(path string) error {
 	return nil
 }
 
-func newHelmValues(s *image.Settings) (map[string]string, error) {
+func newHelmValues(ctx resource.Context, s *image.Settings) (map[string]string, error) {
 	userValues, err := parseHelmValues()
 	if err != nil {
 		return nil, err
@@ -246,6 +298,13 @@ func newHelmValues(s *image.Settings) (map[string]string, error) {
 	if values[image.TagValuesKey] == image.LatestTag {
 		values[image.ImagePullPolicyValuesKey] = string(kubeCore.PullAlways)
 	}
+
+	// We need more information on Envoy logs to detect usage of any deprecated feature
+	if ctx.Settings().FailOnDeprecation {
+		values["global.proxy.logLevel"] = "debug"
+		values["global.proxy.componentLogLevel"] = "misc:debug"
+	}
+
 	return values, nil
 }
 
@@ -270,17 +329,23 @@ func parseHelmValues() (map[string]string, error) {
 func (c *Config) String() string {
 	result := ""
 
-	result += fmt.Sprintf("SystemNamespace:    %s\n", c.SystemNamespace)
-	result += fmt.Sprintf("IstioNamespace:     %s\n", c.IstioNamespace)
-	result += fmt.Sprintf("ConfigNamespace:    %s\n", c.ConfigNamespace)
-	result += fmt.Sprintf("TelemetryNamespace: %s\n", c.TelemetryNamespace)
-	result += fmt.Sprintf("PolicyNamespace:    %s\n", c.PolicyNamespace)
-	result += fmt.Sprintf("IngressNamespace:   %s\n", c.IngressNamespace)
-	result += fmt.Sprintf("EgressNamespace:    %s\n", c.EgressNamespace)
-	result += fmt.Sprintf("DeployIstio:        %v\n", c.DeployIstio)
-	result += fmt.Sprintf("DeployTimeout:      %s\n", c.DeployTimeout.String())
-	result += fmt.Sprintf("UndeployTimeout:    %s\n", c.UndeployTimeout.String())
-	result += fmt.Sprintf("Values:             %v\n", c.Values)
+	result += fmt.Sprintf("SystemNamespace:                %s\n", c.SystemNamespace)
+	result += fmt.Sprintf("IstioNamespace:                 %s\n", c.IstioNamespace)
+	result += fmt.Sprintf("ConfigNamespace:                %s\n", c.ConfigNamespace)
+	result += fmt.Sprintf("TelemetryNamespace:             %s\n", c.TelemetryNamespace)
+	result += fmt.Sprintf("PolicyNamespace:                %s\n", c.PolicyNamespace)
+	result += fmt.Sprintf("IngressNamespace:               %s\n", c.IngressNamespace)
+	result += fmt.Sprintf("EgressNamespace:                %s\n", c.EgressNamespace)
+	result += fmt.Sprintf("DeployIstio:                    %v\n", c.DeployIstio)
+	result += fmt.Sprintf("Operator:                       %v\n", c.Operator)
+	result += fmt.Sprintf("DeployTimeout:                  %s\n", c.DeployTimeout.String())
+	result += fmt.Sprintf("UndeployTimeout:                %s\n", c.UndeployTimeout.String())
+	result += fmt.Sprintf("Values:                         %v\n", c.Values)
+	result += fmt.Sprintf("ChartDir:                       %s\n", c.ChartDir)
+	result += fmt.Sprintf("CrdsFilesDir:                   %s\n", c.CrdsFilesDir)
+	result += fmt.Sprintf("ValuesFile:                     %s\n", c.ValuesFile)
+	result += fmt.Sprintf("SkipWaitForValidationWebhook:   %v\n", c.SkipWaitForValidationWebhook)
+	result += fmt.Sprintf("CustomSidecarInjectorNamespace: %s\n", c.CustomSidecarInjectorNamespace)
 
 	return result
 }

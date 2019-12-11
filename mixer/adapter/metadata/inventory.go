@@ -19,8 +19,9 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/gogo/googleapis/google/rpc"
 	"github.com/gogo/protobuf/types"
+
+	rpc "istio.io/gogo-genproto/googleapis/google/rpc"
 
 	bypass "istio.io/istio/mixer/adapter/bypass/config"
 	circonus "istio.io/istio/mixer/adapter/circonus/config"
@@ -33,9 +34,7 @@ import (
 	memquota "istio.io/istio/mixer/adapter/memquota/config"
 	opa "istio.io/istio/mixer/adapter/opa/config"
 	prometheus "istio.io/istio/mixer/adapter/prometheus/config"
-	rbac "istio.io/istio/mixer/adapter/rbac/config"
 	redisquota "istio.io/istio/mixer/adapter/redisquota/config"
-	signalfx "istio.io/istio/mixer/adapter/signalfx/config"
 	solarwinds "istio.io/istio/mixer/adapter/solarwinds/config"
 	stackdriver "istio.io/istio/mixer/adapter/stackdriver/config"
 	statsd "istio.io/istio/mixer/adapter/statsd/config"
@@ -212,18 +211,6 @@ var (
 		},
 
 		{
-			Name: "rbac",
-			Impl: "istio.io/istio/mixer/adapter/rbac",
-			Description: "Mixer RBAC adapter is deprecated by native RBAC implemented in Envoy proxy. See " +
-				"https://istio.io/docs/concepts/security/#enabling-authorization for enabling the native RBAC with " +
-				"your existing service role and service role binding.",
-			SupportedTemplates: []string{
-				authorization.TemplateName,
-			},
-			DefaultConfig: &rbac.Params{},
-		},
-
-		{
 			Name:        "redisquota",
 			Impl:        "istio.io/mixer/adapter/redisquota",
 			Description: "Redis-based quotas.",
@@ -233,22 +220,6 @@ var (
 			DefaultConfig: &redisquota.Params{
 				RedisServerUrl:     "localhost:6379",
 				ConnectionPoolSize: 10,
-			},
-		},
-
-		{
-			Name:        "signalfx",
-			Description: "Sends metrics and traces to SignalFx",
-			SupportedTemplates: []string{
-				metric.TemplateName,
-				tracespan.TemplateName,
-			},
-			DefaultConfig: &signalfx.Params{
-				EnableMetrics:            true,
-				EnableTracing:            true,
-				DatapointInterval:        10 * time.Second,
-				TracingBufferSize:        1000,
-				TracingSampleProbability: 1.0,
 			},
 		},
 
